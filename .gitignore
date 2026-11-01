@@ -1,0 +1,43 @@
+# Secrets and environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+.cache/
+
+# Crawler output (dry-run results)
+data_crawler/output/
+
+# Data you supply yourself (see db/data/README.md); third-party content is not redistributed
+db/data/*.json
+
+# Local tool state
+.claude/
+.superpowers/

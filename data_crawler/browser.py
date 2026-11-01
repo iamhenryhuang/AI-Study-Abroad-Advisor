@@ -1,0 +1,679 @@
+"""Playwright side: BFS crawling level by level (Node 2) and full-text extraction of one page (Node 4).
+
+- extract_links also carries the anchor text, for the batch LLM URL filter to judge
+- extract_page_content_with_js: 15 DOM sources + expanding accordions / lazy-load, and it provides:
+    * structured_markdown: the expanded DOM goes through trafilatura into markdown (keeping the heading hierarchy and tables)
+    * structured_tables: each <table> converted to markdown (keeping the column mapping)
+    * content_hash: md5 (for cross-page deduplication)
+    * PDF branch: text extraction with pymupdf
+"""
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin
+
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+from .config import CONFIG, USER_AGENT
+from .url_tools import (
+    normalize_url, get_root_info, is_same_root, is_same_host,
+    is_high_value_sibling_url, filter_url, is_pdf,
+)
+from .text_clean import normalize_spaces, deduplicate_text, content_hash
+
+MAX_FULL_TEXT_CHARS = 2_000_000
+MAX_RETRY = 2
+RETRY_WAIT_MS = 2000
+
+# Global concurrency cap: keeps Send fan-out from opening too many browsers at once
+_BROWSER_SEMAPHORE = threading.Semaphore(CONFIG.NUM_WORKERS)
+
+
+# ══════════════════════════════════════════════
+# Shared
+# ══════════════════════════════════════════════
+
+def block_resources(context):
+    context.route("**/*", lambda route: (
+        route.abort()
+        if route.request.resource_type in {"image", "media", "font", "stylesheet"}
+        else route.continue_()
+    ))
+
+
+def _new_browser(p, headless=True):
+    browser = p.chromium.launch(headless=headless)
+    context = browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1440, "height": 900},
+        java_script_enabled=True,
+        ignore_https_errors=True,
+    )
+    block_resources(context)
+    return browser, context
+
+
+def _merge_distinct_text_sources(primary: str, *supplements: str) -> str:
+    """Mainly the visible body text, adding only the non-DOM overlapping sources not already included."""
+    parts = []
+    primary = normalize_spaces(primary)
+    if primary:
+        parts.append(primary)
+    combined = primary.lower()
+    for source in supplements:
+        text = normalize_spaces(source)
+        if not text:
+            continue
+        low = text.lower()
+        if low in combined:
+            continue
+        parts.append(text)
+        combined = f"{combined} {low}".strip()
+    return normalize_spaces(" ".join(parts))
+
+
+# ══════════════════════════════════════════════
+# Node 2: one BFS level (returns dicts)
+# ══════════════════════════════════════════════
+
+def extract_links(page, current_url: str, root_info: dict) -> dict:
+    """Extract links that share the root and can be crawled; semantic relevance is left to the later LLM judgment."""
+    raw_links = page.evaluate("""
+        () => Array.from(document.querySelectorAll('a[href]'))
+                   .map(a => ({href: a.href, text: (a.innerText || '').trim().slice(0, 120)}))
+                   .filter(o => o.href && o.href.length > 0)
+    """) or []
+
+    keep = set()
+    keep_anchors = {}
+    drop = {}
+    external = set()
+
+    for item in raw_links:
+        try:
+            normalized = normalize_url(urljoin(current_url, item["href"]))
+        except Exception:
+            continue
+
+        anchor_text = item.get("text", "")
+        if not is_same_root(normalized, root_info):
+            if not (is_same_host(normalized, root_info)
+                    and is_high_value_sibling_url(normalized, anchor_text)):
+                external.add(normalized)
+                continue
+
+        ok, reason = filter_url(normalized)
+        if ok:
+            keep.add(normalized)
+            if anchor_text and normalized not in keep_anchors:
+                keep_anchors[normalized] = anchor_text
+        else:
+            drop[normalized] = reason
+
+    return {"keep": keep, "keep_anchors": keep_anchors, "drop": drop, "external": external}
+
+
+def crawl_page(page, url: str, root_info: dict) -> dict:
+    result = {
+        "url": url, "title": "",
+        "keep": set(), "keep_anchors": {}, "drop": {}, "external": set(),
+        "error": None,
+    }
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=3000)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(CONFIG.RENDER_WAIT_MS)
+        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(800)
+        page.evaluate("() => window.scrollTo(0, 0)")
+        result["title"] = page.title() or ""
+        links = extract_links(page, url, root_info)
+        result.update(links)
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+def _run_link_worker(task_chunk: list, worker_id: int, print_lock: threading.Lock) -> list:
+    """One worker opens one browser and fetches the links page by page.
+
+    task_chunk: [(url, depth, root_info), ...]
+    """
+    results = []
+    with sync_playwright() as p:
+        browser, context = _new_browser(p)
+        page = context.new_page()
+
+        for idx, (url, depth, root_info) in enumerate(task_chunk):
+            result = crawl_page(page, url, root_info)
+            results.append((url, depth, result))
+
+            with print_lock:
+                status = f"[WARN] {result['error'][:60]}" if result["error"] else f'"{result["title"][:50]}"'
+                print(f"  [w{worker_id}|d={depth}|#{idx+1}] {url}  →  {status}")
+
+            if idx < len(task_chunk) - 1:
+                page.wait_for_timeout(CONFIG.CRAWL_DELAY_MS)
+
+        context.close()
+        browser.close()
+    return results
+
+
+def crawl_one_layer(layer: list[dict], roots: list[str]) -> list[tuple]:
+    """Crawl all URLs of one depth and return [(url, depth, result_dict), ...].
+
+    layer: [{"url", "depth", "root_index"}]
+    Keeps the original multi-worker + block_resources approach, but returns the results instead of writing files.
+    """
+    root_infos = [get_root_info(normalize_url(r)) for r in roots]
+    tasks = [(item["url"], item["depth"], root_infos[item["root_index"]]) for item in layer]
+
+    chunks = [tasks[i::CONFIG.NUM_WORKERS] for i in range(CONFIG.NUM_WORKERS)]
+    chunks = [c for c in chunks if c]
+
+    print_lock = threading.Lock()
+    layer_results: list[tuple] = []
+    with ThreadPoolExecutor(max_workers=CONFIG.NUM_WORKERS) as executor:
+        futures = {
+            executor.submit(_run_link_worker, chunk, wid, print_lock): wid
+            for wid, chunk in enumerate(chunks)
+        }
+        for future in as_completed(futures):
+            try:
+                layer_results.extend(future.result())
+            except Exception as e:
+                print(f"  [WARN] link worker exception: {e}")
+    return layer_results
+
+
+# ══════════════════════════════════════════════
+# Node 4: full-text extraction of one page (plus structured output)
+# ══════════════════════════════════════════════
+
+_SCROLL_JS = """async () => {
+    await new Promise(resolve => {
+        const distance = 300;
+        const delay    = 300;
+        let current    = 0;
+        const total    = document.body.scrollHeight;
+        const timer = setInterval(() => {
+            window.scrollBy(0, distance);
+            current += distance;
+            if (current >= total) {
+                clearInterval(timer);
+                resolve();
+            }
+        }, delay);
+    });
+}"""
+
+_CLICK_EXPANDERS_JS = """() => {
+    const CLICK_SELECTORS = [
+        'button[aria-expanded="false"]',
+        'button.accordion-button',
+        '.accordion-header button',
+        '.accordion-item .accordion-button',
+        'button[data-bs-toggle="collapse"]',
+        'button[data-toggle="collapse"]',
+        'button[class*="accordion"]',
+        'button[class*="toggle"]',
+        'button[class*="collapse"]',
+        'button[class*="expand"]',
+        'button[class*="show"]',
+        'button[class*="open"]',
+        '[class*="toggle-btn"]',
+        '[class*="collapsible"]',
+        '[class*="expand-btn"]',
+        '[class*="read-more"]',
+        '[class*="readmore"]',
+        '[class*="show-more"]',
+        '[class*="load-more"]',
+        'summary',
+        '[role="button"][aria-expanded="false"]:not(a)',
+        'button.faq-question',
+        'button.faq-title',
+        'button.faq-toggle',
+        '[class*="faq"] button',
+        '[class*="faq"] [role="button"]:not(a)',
+        'button[data-target]',
+    ];
+    const clicked = new WeakSet();
+    CLICK_SELECTORS.forEach(sel => {
+        let els;
+        try { els = document.querySelectorAll(sel); } catch(e) { return; }
+        els.forEach(el => {
+            if (clicked.has(el)) return;
+            // The expander may only change the current DOM. Any element with an href/form action could
+            // navigate to another page, so nothing may be clicked automatically just to expand content.
+            if (el.closest('a[href], form') || el.hasAttribute('formaction')) return;
+            clicked.add(el);
+            try {
+                el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                el.click();
+            } catch(e) {}
+        });
+    });
+    window.scrollTo(0, 0);
+}"""
+
+_FORCE_SHOW_JS = """() => {
+    document.querySelectorAll('details').forEach(el => el.open = true);
+    const controlledIds = new Set();
+    document.querySelectorAll(
+        'button[aria-controls], button[data-bs-target], button[data-target], ' +
+        '[role="button"]:not(a)[aria-controls]'
+    ).forEach(control => {
+        const values = [
+            control.getAttribute('aria-controls') || '',
+            control.getAttribute('data-bs-target') || '',
+            control.getAttribute('data-target') || '',
+        ];
+        values.forEach(value => {
+            value.split(/\\s+/).forEach(token => {
+                const id = token.replace(/^#/, '').trim();
+                if (id && /^[A-Za-z][\\w:.-]*$/.test(id)) controlledIds.add(id);
+            });
+        });
+    });
+    const SHOW_SELECTORS = [
+        '.accordion-collapse', '.accordion-content', '.accordion-panel',
+        '.collapse:not(nav):not(header):not(footer)',
+        '[role="region"][aria-labelledby]',
+    ];
+    const reveal = el => {
+        if (!el || el.closest('nav, header, footer, [role="navigation"]')) return;
+        el.style.setProperty('display',     'block',   'important');
+        el.style.setProperty('visibility',  'visible', 'important');
+        el.style.setProperty('opacity',     '1',       'important');
+        el.style.setProperty('max-height',  'none',    'important');
+        el.style.setProperty('height',      'auto',    'important');
+        el.style.setProperty('overflow',    'visible', 'important');
+        el.removeAttribute('hidden');
+        el.removeAttribute('aria-hidden');
+    };
+    SHOW_SELECTORS.forEach(sel => {
+        let els;
+        try { els = document.querySelectorAll(sel); } catch(e) { return; }
+        els.forEach(reveal);
+    });
+    controlledIds.forEach(id => reveal(document.getElementById(id)));
+}"""
+
+_TEXT_SOURCES_JS = {
+    "p_texts": """() => Array.from(document.querySelectorAll('p'))
+        .map(el => el.innerText || el.textContent || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "li_texts": """() => Array.from(document.querySelectorAll('li'))
+        .map(el => el.innerText || el.textContent || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "table_texts": """() => Array.from(document.querySelectorAll('td, th'))
+        .map(el => el.innerText || el.textContent || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "div_texts": """() => Array.from(document.querySelectorAll('div'))
+        .map(el => el.innerText || el.textContent || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "span_texts": """() => Array.from(document.querySelectorAll('span'))
+        .map(el => el.innerText || el.textContent || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "a_texts": """() => Array.from(document.querySelectorAll('a'))
+        .map(el => el.innerText || el.textContent || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "button_texts": """() => Array.from(document.querySelectorAll('button, [role="button"]'))
+        .map(el => el.innerText || el.textContent || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "label_texts": """() => Array.from(document.querySelectorAll('label'))
+        .map(el => el.innerText || el.textContent || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "input_texts": """() => Array.from(document.querySelectorAll('input, textarea'))
+        .map(el => [el.placeholder || '', el.value || '', el.getAttribute('aria-label') || ''].join(' '))
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "option_texts": """() => Array.from(document.querySelectorAll('option'))
+        .map(o => o.textContent || o.value || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "alt_texts": """() => Array.from(document.querySelectorAll('img[alt]'))
+        .map(img => img.getAttribute('alt') || '')
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "aria_texts": """() => Array.from(document.querySelectorAll('[aria-label],[aria-describedby],[title]'))
+        .flatMap(el => [
+            el.getAttribute('aria-label')       || '',
+            el.getAttribute('aria-describedby') || '',
+            el.getAttribute('title')            || '',
+        ])
+        .filter(t => t.trim().length > 0).join(' ')""",
+    "data_attr_texts": """() => {
+        const DATA_KEYS = ['data-content','data-text','data-label',
+                           'data-title','data-description','data-tooltip',
+                           'data-value','data-name'];
+        return Array.from(document.querySelectorAll('*'))
+            .flatMap(el => DATA_KEYS.map(k => el.getAttribute(k) || ''))
+            .filter(t => t.trim().length > 0).join(' ');
+    }""",
+    "meta_desc": """() => {
+        const desc = document.querySelector('meta[name="description"]');
+        const kw   = document.querySelector('meta[name="keywords"]');
+        return [
+            desc ? (desc.getAttribute('content') || '') : '',
+            kw   ? (kw.getAttribute('content')   || '') : '',
+        ].join(' ');
+    }""",
+    "shadow_texts": """() => {
+        function extractShadow(root) {
+            let text = '';
+            root.querySelectorAll('*').forEach(el => {
+                if (el.shadowRoot) text += ' ' + extractShadow(el.shadowRoot);
+            });
+            if (root !== document) text += ' ' + (root.textContent || '');
+            return text;
+        }
+        return extractShadow(document);
+    }""",
+}
+
+_WALKER_JS = """() => {
+    const SKIP_TAGS = new Set(['SCRIPT','STYLE','NOSCRIPT','TEMPLATE']);
+    const parts = [];
+    const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_TEXT,
+        {
+            acceptNode(node) {
+                let p = node.parentElement;
+                while (p) {
+                    if (SKIP_TAGS.has(p.tagName)) return NodeFilter.FILTER_REJECT;
+                    p = p.parentElement;
+                }
+                return node.nodeValue && node.nodeValue.trim()
+                    ? NodeFilter.FILTER_ACCEPT
+                    : NodeFilter.FILTER_SKIP;
+            }
+        }
+    );
+    let node;
+    while ((node = walker.nextNode())) {
+        const t = node.nodeValue.trim();
+        if (t) parts.push(t);
+    }
+    return parts.join(' ');
+}"""
+
+_MAIN_CONTENT_JS = """() => {
+    const SELECTORS = [
+        'main', 'article', '[role="main"]',
+        '#main', '#main-content', '.main-content',
+        '#content', '.content', '.entry-content',
+        '.page-content', '#page-content',
+    ];
+    for (const sel of SELECTORS) {
+        try {
+            const el = document.querySelector(sel);
+            if (el) {
+                const t = el.innerText || el.textContent || '';
+                if (t.trim().length > 500) return t;
+            }
+        } catch(e) {}
+    }
+    return '';
+}"""
+
+# Table -> structured data: each table returns rows (keeping the column mapping)
+_TABLES_JS = """() => Array.from(document.querySelectorAll('table')).slice(0, 30).map(table => {
+    const rows = Array.from(table.querySelectorAll('tr')).slice(0, 100).map(tr =>
+        Array.from(tr.querySelectorAll('th, td'))
+             .map(cell => (cell.innerText || cell.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 300))
+    );
+    return rows.filter(r => r.some(c => c.length > 0));
+}).filter(rows => rows.length > 0)"""
+
+
+def _tables_to_markdown(tables: list) -> str:
+    """Convert the result of _TABLES_JS into a markdown table string."""
+    md_parts = []
+    for rows in tables or []:
+        if not rows:
+            continue
+        width = max(len(r) for r in rows)
+        norm = [r + [""] * (width - len(r)) for r in rows]
+        lines = ["| " + " | ".join(norm[0]) + " |",
+                 "| " + " | ".join(["---"] * width) + " |"]
+        for r in norm[1:]:
+            lines.append("| " + " | ".join(r) + " |")
+        md_parts.append("\n".join(lines))
+    return "\n\n".join(md_parts)
+
+
+def _html_to_markdown(html: str, url: str) -> str:
+    """Expanded DOM HTML -> markdown (trafilatura; keeps the heading hierarchy and tables)."""
+    if not html:
+        return ""
+    try:
+        import trafilatura
+        md = trafilatura.extract(
+            html,
+            url=url,
+            output_format="markdown",
+            include_tables=True,
+            include_links=False,
+            include_formatting=True,
+            favor_recall=True,
+        )
+        return md or ""
+    except Exception as e:
+        print(f"  [WARN] trafilatura failed ({url}): {e}")
+        return ""
+
+
+def extract_page_content_with_js(page, url, extra_wait_ms=3000):
+    """Extracts the page text, plus structured_markdown / structured_tables / content_hash."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(extra_wait_ms)
+
+        # STEP 1-3: scroll slowly -> open every expandable element -> force the leftover hidden nodes to show
+        page.evaluate(_SCROLL_JS)
+        page.wait_for_timeout(1000)
+        page_url_before_expand = page.url
+        page.evaluate(_CLICK_EXPANDERS_JS)
+        page.wait_for_timeout(1200)
+        # A site may bind a control that looks like a button to a page-navigation action. If navigation still happens, reload
+        # the page from before the expansion; content of another page must never be filed under the original URL.
+        if page.url != page_url_before_expand:
+            print(f"  [WARN] expander navigation blocked: {page_url_before_expand} → {page.url}")
+            page.goto(page_url_before_expand, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeoutError:
+                pass
+            page.wait_for_timeout(extra_wait_ms)
+        page.evaluate(_FORCE_SHOW_JS)
+        page.wait_for_timeout(600)
+
+        # STEP 4: extract every text source
+        title = page.title() or ""
+        h1_list = [normalize_spaces(x) for x in page.locator("h1").all_inner_texts() if normalize_spaces(x)]
+        h2_list = [normalize_spaces(x) for x in page.locator("h2").all_inner_texts() if normalize_spaces(x)]
+        h3_list = [normalize_spaces(x) for x in page.locator("h3").all_inner_texts() if normalize_spaces(x)]
+
+        visible_text = normalize_spaces(page.evaluate("() => document.body.innerText || ''") or "")
+        walker_texts = normalize_spaces(page.evaluate(_WALKER_JS) or "")
+
+        # Count only the sources that are really used later and that do not recursively include the whole DOM.
+        source_keys = (
+            "p_texts", "input_texts", "option_texts", "alt_texts",
+            "aria_texts", "data_attr_texts", "meta_desc",
+        )
+        sources = {}
+        for key in source_keys:
+            js = _TEXT_SOURCES_JS[key]
+            try:
+                sources[key] = normalize_spaces(page.evaluate(js) or "")
+            except Exception:
+                sources[key] = ""
+
+        nav_text = normalize_spaces(page.evaluate("""
+            () => Array.from(document.querySelectorAll('nav, [role="navigation"], header'))
+                       .map(el => el.innerText || el.textContent || '').join(' ')
+        """) or "")
+        emphasis_text = normalize_spaces(page.evaluate("""
+            () => Array.from(document.querySelectorAll('strong, em, b, mark, cite'))
+                       .map(el => el.innerText || el.textContent || '')
+                       .filter(t => t.trim().length > 0).join(' ')
+        """) or "")
+
+        iframe_texts = ""
+        try:
+            iframe_texts = normalize_spaces(page.evaluate("""
+                () => {
+                    let text = '';
+                    document.querySelectorAll('iframe').forEach(iframe => {
+                        try {
+                            const body = iframe.contentDocument && iframe.contentDocument.body;
+                            if (body) text += ' ' + (body.innerText || body.textContent || '');
+                        } catch(e) {}
+                    });
+                    return text;
+                }
+            """) or "")
+        except Exception:
+            pass
+
+        main_content = ""
+        try:
+            main_content = normalize_spaces(page.evaluate(_MAIN_CONTENT_JS) or "")
+        except Exception:
+            pass
+
+        # body.innerText is the full text the browser actually renders, and it already covers main/p/li/table/div/span/a.
+        # Do not also merge body.textContent or the textContent of all div/span: some sites put
+        # <style> inside body, which would pour hundreds of thousands of characters of CSS and duplicated ancestor content into the full text.
+        primary_text = visible_text
+        if len(primary_text) < 200:
+            primary_text = main_content or walker_texts
+        full_text = _merge_distinct_text_sources(
+            primary_text,
+            sources["input_texts"],
+            sources["option_texts"],
+            sources["alt_texts"],
+            sources["aria_texts"],
+            sources["data_attr_texts"],
+            sources["meta_desc"],
+            iframe_texts,
+        )
+        if len(full_text) > MAX_FULL_TEXT_CHARS:
+            full_text = full_text[:MAX_FULL_TEXT_CHARS]
+        full_text = deduplicate_text(full_text)
+
+        # -- New: structured output (the DOM is already expanded; these are just two more ways to present it) --
+        raw_tables = []
+        try:
+            raw_tables = page.evaluate(_TABLES_JS) or []
+        except Exception:
+            pass
+        structured_tables = _tables_to_markdown(raw_tables)
+
+        structured_markdown = ""
+        try:
+            html = page.content()
+            structured_markdown = _html_to_markdown(html, url)
+        except Exception:
+            pass
+
+        return {
+            "title": title,
+            "final_url": normalize_url(page.url),
+            "h1_list": h1_list, "h2_list": h2_list, "h3_list": h3_list,
+            "full_text": full_text,
+            "nav_text": nav_text,
+            "emphasis_text": emphasis_text,
+            "p_texts": sources["p_texts"],
+            "structured_markdown": structured_markdown,
+            "structured_tables": structured_tables,
+            "content_hash": content_hash(full_text),
+            "error": None,
+        }
+
+    except Exception as e:
+        return {
+            "title": "", "final_url": normalize_url(page.url) if page else normalize_url(url),
+            "h1_list": [], "h2_list": [], "h3_list": [],
+            "full_text": "", "nav_text": "", "emphasis_text": "", "p_texts": "",
+            "structured_markdown": "", "structured_tables": "",
+            "content_hash": "", "error": str(e),
+        }
+
+
+def extract_pdf_content(url: str) -> dict:
+    """PDF branch: download + extract text with pymupdf (including simple table-to-markdown conversion)."""
+    try:
+        import urllib.request
+        import fitz  # pymupdf
+
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+
+        doc = fitz.open(stream=data, filetype="pdf")
+        pages_text = []
+        tables_md = []
+        for pno in range(min(len(doc), 50)):
+            pg = doc[pno]
+            pages_text.append(pg.get_text("text"))
+            try:
+                for tab in pg.find_tables().tables[:5]:
+                    tables_md.append(tab.to_markdown())
+            except Exception:
+                pass
+        doc.close()
+
+        full_text = normalize_spaces(" ".join(pages_text))[:MAX_FULL_TEXT_CHARS]
+        markdown = "\n\n".join(pages_text)
+        return {
+            "title": url.rsplit("/", 1)[-1],
+            "final_url": normalize_url(url),
+            "h1_list": [], "h2_list": [], "h3_list": [],
+            "full_text": full_text,
+            "nav_text": "", "emphasis_text": "", "p_texts": "",
+            "structured_markdown": markdown,
+            "structured_tables": "\n\n".join(tables_md),
+            "content_hash": content_hash(full_text),
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "title": "", "final_url": normalize_url(url),
+            "h1_list": [], "h2_list": [], "h3_list": [],
+            "full_text": "", "nav_text": "", "emphasis_text": "", "p_texts": "",
+            "structured_markdown": "", "structured_tables": "",
+            "content_hash": "", "error": str(e),
+        }
+
+
+def scrape_url(url: str) -> dict:
+    """Node 4 entry point: one URL -> full text + structured content (with retries, at the same pace as before).
+
+    Limits the number of browsers open at once with a semaphore (the concurrency cap of the Send fan-out).
+    """
+    if is_pdf(url):
+        return extract_pdf_content(url)
+
+    with _BROWSER_SEMAPHORE:
+        with sync_playwright() as p:
+            browser, context = _new_browser(p)
+            page = context.new_page()
+            extracted = None
+            for attempt in range(1, MAX_RETRY + 2):
+                if attempt > 1:
+                    print(f"   [RETRY] {attempt-1}/{MAX_RETRY} {url}")
+                    page.wait_for_timeout(RETRY_WAIT_MS)
+                extracted = extract_page_content_with_js(page, url)
+                if not extracted["error"]:
+                    break
+            context.close()
+            browser.close()
+    return extracted
