@@ -33,14 +33,14 @@ The planner decides which of these a question needs, and independent paths run i
 
 | Path | Implementation | Source |
 |---|---|---|
-| SQL | `retriever/sql_search.py` | `programs` and its child tables (official requirements) |
-| Hybrid | `retriever/hybrid_search.py` | embedding + full-text + rank fusion over `document_chunks` |
-| Full-text | `retriever/fulltext_search.py` | `document_chunks.fts_vector` |
-| Experience | `retriever/applicant_search.py` | `applicant_reports` and `user_experiences` (unofficial) |
+| SQL | `retriever/search/sql_search.py` | `programs` and its child tables (official requirements) |
+| Hybrid | `retriever/search/hybrid_search.py` | embedding + full-text + rank fusion over `document_chunks` |
+| Full-text | `retriever/search/fulltext_search.py` | `document_chunks.fts_vector` |
+| Experience | `retriever/search/applicant_search.py` | `applicant_reports` and `user_experiences` (unofficial) |
 | Recommend | `retriever/recommend.py` | community cases and the user's scores |
-| Professor | `retriever/professor_list_search.py`, `professor_fetcher/` | `professors`; SerpAPI for a named professor |
+| Professor | `retriever/search/professor_list_search.py`, `professor_fetcher/` | `professors`; SerpAPI for a named professor |
 
-Official-requirement questions try text-to-SQL first. When the result is insufficient, or the language model is unavailable, the agent searches the official page text. Embeddings are optional: without them the system uses PostgreSQL full-text search.
+Official-requirement questions try text-to-SQL first. When the result is insufficient, or the language model is unavailable, the agent searches the official page text. Embeddings are optional: until vectors are backfilled the system uses PostgreSQL full-text search and does not load the models.
 
 To enable vector retrieval, backfill embeddings once:
 
@@ -68,13 +68,13 @@ Community experiences are unofficial. Answers label them as such and note sample
 
 Two kinds of faculty questions:
 
-1. "Which Stanford professors work on AI?" is answered from the `professors` table you loaded.
+1. "Which Stanford professors work on AI?" is answered from the `professors` table you loaded. The search returns the school's first 30 professors by name and the language model picks from those, so a larger list is cut off.
 2. "What does Fei-Fei Li research?" looks the named professor up through SerpAPI at query time.
 
 Faculty rows attach to `universities.school_id`, so crawl the schools first. Build `db/data/professors.json` (the format is in [`db/data/README.md`](../db/data/README.md)), then run:
 
 ```bash
-python backend/scripts/run.py load-professors
+python backend/run.py load-professors
 ```
 
 If the loader reports that a school does not exist, run `verify-db`, and make sure `init-schema` was not run again after crawling.
@@ -93,10 +93,10 @@ Restarting the process makes the first model call re-check whether the provider 
 ## 6. Command line
 
 ```bash
-python backend/scripts/run.py search "Gatech TOEFL 要求"
-python backend/scripts/run.py rag "Purdue IELTS 要求"
-python backend/scripts/run.py agent "Stanford 有哪些 AI 教授？"
-python backend/scripts/run.py verify-db
+python backend/run.py search "Gatech TOEFL 要求"
+python backend/run.py rag "Purdue IELTS 要求"
+python backend/run.py agent "Stanford 有哪些 AI 教授？"
+python backend/run.py verify-db
 ```
 
 Use `agent` for the real behavior. `search` exercises text-to-SQL only, and `rag` is a simpler single-pass retrieval flow.
@@ -105,16 +105,18 @@ Use `agent` for the real behavior. `search` exercises text-to-SQL only, and `rag
 
 ```text
 backend/
-├── api.py                    FastAPI and SSE
-└── scripts/
-    ├── database/             connection, initialization, verification
-    ├── generator/            OpenAI client, prompts, answer generation
-    ├── professor_fetcher/    SerpAPI faculty lookup
-    └── retriever/
-        ├── agent/            LangGraph state, nodes, runtime
-        ├── sql_search.py
-        ├── fulltext_search.py
-        ├── hybrid_search.py
-        ├── applicant_search.py
-        └── recommend.py
+├── api.py                     FastAPI and SSE
+├── run.py                     command line
+├── settings.py                project paths, loads backend/.env
+├── database/                  connection, schema commands, user experiences
+├── generator/                 OpenAI client, prompts, answer generation
+├── professor_fetcher/         SerpAPI faculty lookup
+└── retriever/
+    ├── agent/                 LangGraph state, nodes, prompts, runtime
+    ├── search/                sql_search, fulltext_search, hybrid_search (with vectorize and reranker),
+    │                          applicant_search, professor_list_search
+    ├── school_aliases.py      school names and detection
+    ├── contextualize.py       rewrites a follow-up into a standalone question
+    ├── rag_pipeline.py        single-pass flow behind `run.py rag`
+    └── recommend.py           reach, match and safety tiers
 ```

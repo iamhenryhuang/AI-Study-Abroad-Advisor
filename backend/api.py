@@ -6,13 +6,14 @@ import asyncio
 import json
 import os
 import sys
-from pathlib import Path
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Literal
 
-SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+BACKEND_DIR = Path(__file__).resolve().parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,13 +46,13 @@ app.add_middleware(
 
 
 class ChatMessage(BaseModel):
-    role: str        # "user" | "assistant"
-    content: str
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=20000)
 
 
 class ChatRequest(BaseModel):
-    query: str
-    max_steps: int = 5
+    query: str = Field(min_length=1, max_length=2000)
+    max_steps: int = Field(default=5, ge=1, le=50)
     history: list[ChatMessage] = Field(default_factory=list, max_length=20)
 
 
@@ -134,11 +135,13 @@ async def chat(request: ChatRequest):
     SSE endpoint: streams the agent's reasoning steps and the final answer.
 
     Event format (one JSON object per line):
-      {"type": "thinking",    "step": 1}
-      {"type": "tool_call",   "tool": "search_school", "args": {...}}
-      {"type": "tool_result", "tool": "search_school", "preview": "..."}
-      {"type": "answer",      "text": "..."}
-      {"type": "error",       "message": "..."}
+      {"type": "thinking",     "step": 1}
+      {"type": "tool_call",    "tool": "sql_search", "args": {...}}
+      {"type": "tool_result",  "tool": "sql_search", "preview": "..."}
+      {"type": "llm_call",     "purpose": "finalizer"}
+      {"type": "answer_chunk", "text": "..."}
+      {"type": "answer",       "text": "..."}
+      {"type": "error",        "message": "..."}
     """
     cancel_event: threading.Event = threading.Event()
     terminal_event_sent: threading.Event = threading.Event()
