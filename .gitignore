@@ -32,8 +32,9 @@ Thumbs.db
 *.tmp
 .cache/
 
-# Crawler output (dry-run results)
+# Crawler output (audit JSON and URL filter decisions; contains crawled third-party text)
 data_crawler/output/
+data_crawler/url/
 
 # Data you supply yourself (see db/data/README.md); third-party content is not redistributed
 db/data/*.json
