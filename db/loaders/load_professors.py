@@ -3,7 +3,7 @@ Write professors (the faculty seed data) from db/data/professors.json.
 
 Every row must map to an existing universities.school_id (created by data_crawler first); this script does not create new schools.
 
-Run: python db/load_professors.py
+Run: python db/loaders/load_professors.py
 """
 from __future__ import annotations
 
@@ -11,14 +11,14 @@ import json
 import sys
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_BACKEND_SCRIPTS = _PROJECT_ROOT / "backend" / "scripts"
-if str(_BACKEND_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_BACKEND_SCRIPTS))
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_BACKEND = _PROJECT_ROOT / "backend"
+if str(_BACKEND) not in sys.path:
+    sys.path.insert(0, str(_BACKEND))
 
 from database.connection import get_connection
 
-DATA_PATH = Path(__file__).resolve().parent / "data" / "professors.json"
+DATA_PATH = _PROJECT_ROOT / "db" / "data" / "professors.json"
 
 
 def load() -> bool:

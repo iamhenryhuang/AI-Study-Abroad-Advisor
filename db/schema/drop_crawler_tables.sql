@@ -1,8 +1,6 @@
--- ════════════════════════════════════════════════════════════════
--- Study Abroad RAG — the schema follows what data_crawler can extract/write
--- Real data source: written by data_crawler (the LangGraph crawler)
--- db/data/schools_data.json is only fake test data that matches this schema
--- ════════════════════════════════════════════════════════════════
+-- Drops the crawler tables. `python backend/run.py init-schema` runs this file and then crawler_tables.sql.
+-- This deletes all crawled data; the table definitions live in crawler_tables.sql.
+-- If you run this file by hand with psql, remember to follow it with: \i db/schema/crawler_tables.sql
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -21,7 +19,3 @@ DROP TABLE IF EXISTS program_deadlines       CASCADE;
 DROP TABLE IF EXISTS professors              CASCADE;
 DROP TABLE IF EXISTS programs                CASCADE;
 DROP TABLE IF EXISTS universities            CASCADE;
-
--- The table definitions live in db/schema_programs.sql (the single source of truth, shared with data_crawler).
--- This file only "clears first"; run.py init-schema then runs that shared file to create the tables.
--- If you run this file by hand with psql, remember to follow it with: \i db/schema_programs.sql

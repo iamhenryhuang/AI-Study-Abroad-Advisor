@@ -5,10 +5,10 @@ Sources (all experience-type, unofficial data):
   db/data/1point3.json          -- 1point3acres (Simplified Chinese, semi-structured)
 
 Run:
-  python db/load_applicant_reports.py            # the migration must have been run to create the table
-  python db/load_applicant_reports.py --migrate  # also apply the migration SQL first
+  python db/loaders/load_applicant_reports.py                 # the table must already exist
+  python db/loaders/load_applicant_reports.py --create-table  # also create the table first
 
-See the _clean_* functions and the comments in db/migrations/001_applicant_reports.sql for the cleaning strategy.
+See the _clean_* functions and the comments in db/schema/applicant_reports.sql for the cleaning strategy.
 Safe to re-run: (source, source_url) is UNIQUE, and ON CONFLICT updates the existing row.
 """
 from __future__ import annotations
@@ -18,46 +18,31 @@ import re
 import sys
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_BACKEND_SCRIPTS = _PROJECT_ROOT / "backend" / "scripts"
-if str(_BACKEND_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_BACKEND_SCRIPTS))
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_BACKEND = _PROJECT_ROOT / "backend"
+if str(_BACKEND) not in sys.path:
+    sys.path.insert(0, str(_BACKEND))
 
 from database.connection import get_connection
+from retriever.school_aliases import detect_school_ids
 
-_DATA_DIR = Path(__file__).resolve().parent / "data"
+_DATA_DIR = _PROJECT_ROOT / "db" / "data"
 GRADCAFE_PATH = _DATA_DIR / "gradcafe_results.json"
 ONEPOINT3_PATH = _DATA_DIR / "1point3.json"
-MIGRATION_PATH = Path(__file__).resolve().parent / "migrations" / "001_applicant_reports.sql"
-
-# Reuse the agent's school alias table to map raw school names to the DB's school_id (mit/cmu...)
-from retriever.agent.state import _SCHOOL_ALIASES
+TABLE_SQL_PATH = _PROJECT_ROOT / "db" / "schema" / "applicant_reports.sql"
 
 
 # --- Shared cleaning helpers -------------------------------------------------------
 
-# Known cases where matching an alias by substring misfires: the school name contains the keyword but is a different school, so exclude it directly
-#   'columbia' would wrongly file University of British Columbia (UBC) under columbia
-_ALIAS_FALSE_POSITIVES = [
-    ("columbia", "british columbia"),   # UBC is not Columbia University
-]
+def _text(value) -> str:
+    """A user-built JSON field as stripped text; scores may be written as numbers rather than strings."""
+    return "" if value is None else str(value).strip()
 
 
 def _match_school_id(school_raw: str) -> str | None:
     """Map a raw school name to a school_id with the alias table; return None when nothing matches (keeping school_raw is enough)."""
-    if not school_raw or not _SCHOOL_ALIASES:
-        return None
-    text = school_raw.lower()
-    for sid, aliases in _SCHOOL_ALIASES.items():
-        for alias in aliases:
-            if alias not in text:
-                continue
-            # Exclude known substring misfires (such as UBC matching columbia)
-            if any(alias == bad_sid_alias and marker in text
-                   for bad_sid_alias, marker in _ALIAS_FALSE_POSITIVES):
-                continue
-            return sid
-    return None
+    detected = detect_school_ids(school_raw)
+    return detected[0] if detected else None
 
 
 def _parse_gpa(raw: str | None) -> float | None:
@@ -179,23 +164,18 @@ def _clean_1point3(data: dict) -> list[dict]:
     out = []
     for school_key, posts in data.items():
         for p in posts:
-            url = (p.get("url") or "").strip()
-            school_raw = (p.get("school") or school_key or "").strip()
+            url = _text(p.get("url"))
+            school_raw = _text(p.get("school") or school_key)
             if not school_raw:
                 continue
             gpa_raw = p.get("gpa") or None
             # notes: title + cleaned short body (most post bodies are very short, so they are merged into one readable summary)
-            title = (p.get("title") or "").strip()
+            title = _text(p.get("title"))
             content = _clean_content(p.get("content"))
             extras = []
-            if (p.get("major") or "").strip():
-                extras.append(f"專業:{p['major'].strip()}")
-            if (p.get("undergrad_school") or "").strip():
-                extras.append(f"本科:{p['undergrad_school'].strip()}")
-            if (p.get("toefl") or "").strip():
-                extras.append(f"TOEFL:{p['toefl'].strip()}")
-            if (p.get("gre") or "").strip():
-                extras.append(f"GRE:{p['gre'].strip()}")
+            for label, field in (("專業", "major"), ("本科", "undergrad_school"), ("TOEFL", "toefl"), ("GRE", "gre")):
+                if _text(p.get(field)):
+                    extras.append(f"{label}:{_text(p.get(field))}")
             notes = " | ".join(filter(None, [title, " ".join(extras) or None, content])) or None
 
             out.append({
@@ -203,7 +183,7 @@ def _clean_1point3(data: dict) -> list[dict]:
                 "source_url":   url or f"1point3:{school_key}:{title[:40]}",
                 "school_raw":   school_raw,
                 "school_id":    _match_school_id(school_raw),
-                "program":      (p.get("major") or "").strip() or None,
+                "program":      _text(p.get("major")) or None,
                 "degree_level": None,   # the forum does not distinguish masters/phd, so leave it empty
                 "decision":     _ONEPOINT3_RESULT.get(p.get("result"), "other"),
                 "gpa":          _parse_gpa(gpa_raw),
@@ -231,7 +211,7 @@ _INSERT_SQL = """
 """
 
 
-def load(apply_migration: bool = False) -> bool:
+def load(create_table: bool = False) -> bool:
     conn = get_connection()
     if not conn:
         print("Set DATABASE_URL in backend/.env.")
@@ -239,12 +219,13 @@ def load(apply_migration: bool = False) -> bool:
 
     try:
         with conn.cursor() as cur:
-            if apply_migration:
-                if not MIGRATION_PATH.is_file():
-                    print(f"Migration not found: {MIGRATION_PATH}")
+            if create_table:
+                if not TABLE_SQL_PATH.is_file():
+                    print(f"Not found: {TABLE_SQL_PATH}")
                     return False
-                cur.execute(MIGRATION_PATH.read_text(encoding="utf-8"))
-                print("Applied migration 001_applicant_reports.sql")
+                cur.execute(TABLE_SQL_PATH.read_text(encoding="utf-8"))
+                conn.commit()   # keep the table even if there is no data to load yet
+                print("Created or confirmed the applicant_reports table.")
 
             records: list[dict] = []
             if GRADCAFE_PATH.is_file():
@@ -274,5 +255,4 @@ def load(apply_migration: bool = False) -> bool:
 
 
 if __name__ == "__main__":
-    apply_mig = "--migrate" in sys.argv
-    sys.exit(0 if load(apply_migration=apply_mig) else 1)
+    sys.exit(0 if load(create_table="--create-table" in sys.argv) else 1)

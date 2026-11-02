@@ -6,10 +6,10 @@ School information is crawled by `data_crawler` and does not come from this fold
 
 | File | Used by | Required for |
 |---|---|---|
-| `professors.json` | `python backend/scripts/run.py load-professors` | the "which professors work on X" question |
-| `gradcafe_results.json` | `python db/load_applicant_reports.py` | Experience retrieval |
-| `1point3.json` | `python db/load_applicant_reports.py` | Experience retrieval |
-| `1point3_distribution.json` | `backend/scripts/retriever/recommend.py` | school recommendation |
+| `professors.json` | `python backend/run.py load-professors` | the "which professors work on X" question |
+| `gradcafe_results.json` | `python db/loaders/load_applicant_reports.py` | Experience retrieval |
+| `1point3.json` | `python db/loaders/load_applicant_reports.py` | Experience retrieval |
+| `1point3_distribution.json` | `backend/retriever/recommend.py` | school recommendation |
 
 ## professors.json
 

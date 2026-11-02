@@ -1,11 +1,10 @@
 -- ════════════════════════════════════════════════════════════════
--- programs family -- shared table definitions (the single source of truth)
+-- Crawler tables -- shared table definitions (the single source of truth)
 --
 -- This file "only creates tables, never drops them" and is fully idempotent (IF NOT EXISTS), so both sides can use it:
---   db/init_db.sql        DROPs the existing tables, then uses this file -> rebuild style, start from scratch
---   data_crawler/db.py    uses this file directly                         -> additive style, existing data untouched
+--   backend/run.py init-schema   runs drop_crawler_tables.sql, then this file -> rebuild style, start from scratch
+--   data_crawler/db.py           runs this file directly                      -> additive style, existing data untouched
 --
--- These definitions used to be written once in each of the two places above, kept in sync only by a comment, and they drifted easily.
 -- Change columns here only, and both sides stay consistent automatically.
 -- ════════════════════════════════════════════════════════════════
 
@@ -93,9 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_programs_degree     ON programs(degree_type);
 
 -- ────────────────────────────────────────────────────────────────
 -- updated_at is maintained automatically
---   Child tables used to rely on every writer supplying CURRENT_TIMESTAMP itself, and as soon as one
---   write path forgot, NULL was left behind (the INSERT in load_schools.py did exactly that).
---   A trigger now maintains it in one place, so no writer has to care about this column any more.
+--   A trigger maintains it in one place, so no writer has to care about this column.
 -- ────────────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
 BEGIN
@@ -306,7 +303,7 @@ CREATE INDEX IF NOT EXISTS idx_review_queue_status     ON review_queue(status);
 
 
 -- ════════════════════════════════════════════════════════════════
--- 9. professors  -- seed data for the faculty list (written by hand through db/load_professors.py,
+-- 9. professors  -- seed data for the faculty list (written by hand through db/loaders/load_professors.py,
 --    not produced by data_crawler; data_crawler does not process faculty pages for now)
 -- ════════════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS professors (

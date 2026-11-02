@@ -10,8 +10,7 @@
 --       not "what scores does the school require". When RAG cites them it must label them as unofficial experience,
 --       and never present them as an admission threshold or a guarantee (the guardrail is in the backend generation prompt).
 --
--- Additive migration: CREATE IF NOT EXISTS, leaves db/init_db.sql alone,
--- and is not wiped by run.py init-schema (which rebuilds the programs family).
+-- Idempotent: CREATE IF NOT EXISTS. It is not one of the crawler tables, so run.py init-schema does not drop it.
 -- ════════════════════════════════════════════════════════════════
 
 CREATE TABLE IF NOT EXISTS applicant_reports (
@@ -21,7 +20,7 @@ CREATE TABLE IF NOT EXISTS applicant_reports (
 
     -- School: the raw school name is always kept; school_id maps onto the universities alias system where possible, and stays NULL when nothing matches
     school_raw    TEXT NOT NULL,
-    school_id     VARCHAR(100),                -- maps to _SCHOOL_ALIASES (mit/cmu...), NULL when nothing matches
+    school_id     VARCHAR(100),                -- maps to SCHOOL_ALIASES (mit/cmu...), NULL when nothing matches
 
     program       TEXT,
     degree_level  VARCHAR(20),                 -- masters / phd / mfa / other...

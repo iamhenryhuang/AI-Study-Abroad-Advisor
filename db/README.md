@@ -1,6 +1,6 @@
 # db
 
-PostgreSQL + pgvector schema, migrations and batch loaders. Runtime connection and operations live in `backend/scripts/database/`. Installation is in the [top-level README](../README.md).
+PostgreSQL + pgvector schema and batch loaders. Runtime connection and operations live in `backend/database/`. Installation is in the [top-level README](../README.md).
 
 ## Contents
 
@@ -17,20 +17,20 @@ PostgreSQL + pgvector schema, migrations and batch loaders. Runtime connection a
 | Universities and requirements | `universities`, `programs` | schools, programs, and TOEFL, IELTS, GRE, GPA, fees, recommendation letters, SOP fields |
 | One-to-many application data | `program_deadlines`, `program_scholarships`, `program_app_materials` | deadlines, aid, special materials |
 | Official text | `web_pages`, `document_chunks` | cleaned pages and retrieval chunks; `fts_vector` is generated automatically, `embedding` can be backfilled |
-| Supporting evidence | `program_evidence`, `global_extractions` | content that should not be forced into a column but still has a source |
+| Supporting evidence | `program_evidence`, `global_extractions` | content that should not be forced into a column but still has a source (the crawler currently fills only `program_evidence`) |
 | Quality control | `review_queue` | fields that failed validation and wait for manual review |
 | Faculty | `professors` | name, title, research areas, official link |
 | Community | `applicant_reports`, `user_experiences` | GradCafe and 1point3acres reports, and user submissions |
 
-`schema_programs.sql` is the single source of the crawler tables. `init_db.sql` drops them, and the migration in `data_crawler/db.py` only upgrades additively.
+`schema/crawler_tables.sql` is the single source of the crawler tables. `schema/drop_crawler_tables.sql` drops them, and the migration in `data_crawler/db.py` only upgrades additively.
 
 ## 2. Where data comes from
 
 | Source | Written by | Main tables |
 |---|---|---|
 | Official websites | `python -m data_crawler.main ...` | `universities`, the `programs` family, `web_pages`, `document_chunks` |
-| Faculty list you provide | `python backend/scripts/run.py load-professors` | `professors` |
-| GradCafe and 1point3acres | `python db/load_applicant_reports.py --migrate` | `applicant_reports` |
+| Faculty list you provide | `python backend/run.py load-professors` | `professors` |
+| GradCafe and 1point3acres | `python db/loaders/load_applicant_reports.py --create-table` | `applicant_reports` |
 | User form | FastAPI experiences endpoint | `user_experiences` |
 
 Faculty rows attach through `universities.school_id`, so crawl a school before loading its faculty. A professor with the same name at the same school is upserted on `UNIQUE (university_id, name)`.
@@ -43,14 +43,14 @@ The community files and the faculty list are not part of this repository; [`data
 
 ```bash
 # Once, at the very beginning
-python backend/scripts/run.py setup
-python backend/scripts/run.py init-schema
-python backend/scripts/run.py init-experience
+python backend/run.py setup
+python backend/run.py init-schema
+python backend/run.py init-experience
 
 python -m data_crawler.main --school-id stanford --max-depth 1 --max-pages 10
 
-python backend/scripts/run.py load-professors
-python backend/scripts/run.py verify-db
+python backend/run.py load-professors
+python backend/run.py verify-db
 ```
 
 If you do have the community files, `init-full` replaces the first three commands: it rebuilds the crawler schema and also loads the community reports.
@@ -79,10 +79,10 @@ Without `--dry-run`, and with `DATABASE_URL` set, it writes to the database dire
 
 ## 5. Files
 
-- `schema_programs.sql`: single source of the crawler schema.
-- `init_db.sql`: the DROP step before a rebuild.
-- `init_experience.sql`: the user experience table.
-- `migrations/001_applicant_reports.sql`: community report table and full-text index.
-- `load_applicant_reports.py`: cleans and upserts community reports.
-- `load_professors.py`: upserts a faculty list you provide in `data/professors.json`.
+- `schema/crawler_tables.sql`: single source of the crawler schema.
+- `schema/drop_crawler_tables.sql`: the DROP step before a rebuild.
+- `schema/user_experiences.sql`: the user experience table.
+- `schema/applicant_reports.sql`: community report table and full-text index.
+- `loaders/load_applicant_reports.py`: cleans and upserts community reports.
+- `loaders/load_professors.py`: upserts a faculty list you provide in `data/professors.json`.
 - `data/`: empty on purpose. [`data/README.md`](data/README.md) describes the files you build yourself (faculty, community reports, school medians) and their format.
