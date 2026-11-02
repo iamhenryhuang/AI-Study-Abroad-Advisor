@@ -11,9 +11,7 @@ the env var BGE_EMBED_MODEL_PATH can point to a local model path.
 import argparse
 import os
 
-from dotenv import load_dotenv
-
-load_dotenv()
+from .db import get_connection   # also loads backend/.env
 
 
 def main():
@@ -24,7 +22,6 @@ def main():
     args = ap.parse_args()
 
     from sentence_transformers import SentenceTransformer
-    from .db import get_connection
 
     # An empty env var (BGE_EMBED_MODEL_PATH= in .env) counts as unset -> use the default hub id;
     # trust_remote_code=True: needed to load BGE-M3 with newer sentence-transformers.

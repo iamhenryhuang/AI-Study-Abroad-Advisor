@@ -42,7 +42,7 @@ class SchoolState(TypedDict, total=False):
 
     # -- Phase 2: collecting the scrape fan-out -----------------
     scraped_pages: Annotated[list[dict], operator.add]
-    unique_pages: list[dict]   # after content-hash dedup
+    unique_pages: list[dict]   # after final-URL dedup and error removal
 
     # -- Phase 3-4: collecting the page-pipeline fan-out --------
     page_results: Annotated[list[dict], operator.add]
@@ -85,6 +85,7 @@ class ProcessState(TypedDict, total=False):
     # Node 8
     validation: dict           # {"passed": bool, "issues": [...], "confidence": float}
     validation_repair_retries: int
+    rejected_issues: list[dict]  # issues of earlier validation rounds, whose values the repair step removed
 
     # Output (merged back into the main graph)
     page_results: Annotated[list[dict], operator.add]

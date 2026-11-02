@@ -5,17 +5,31 @@ One Send branch handles one page; the output page_results / review_items is merg
 """
 import json
 import re
+from datetime import date
 
-from .state import ProcessState, KEEP_TYPES
-from .url_tools import score_url_path
-from .llm import call_llm_json, llm_is_unavailable
-from .prompts import classification_prompt, extraction_prompt, validation_repair_prompt
+from ..llm import call_llm_json, llm_is_unavailable
+from ..prompts import classification_prompt, extraction_prompt, validation_repair_prompt
+from ..state import ProcessState, KEEP_TYPES
+from ..url_tools import score_url_path
 
 EXTRACT_CHUNK_CHARS = 26_000
 EXTRACT_CHUNK_OVERLAP_CHARS = 2_000
 MAX_VALIDATION_REPAIRS = 2
 CONFIDENCE_THRESHOLD = 0.6  # a classification confidence below this counts as irrelevant
 TARGET_PROGRAM_CODE = "INTERNATIONAL_CS_MASTERS"
+
+
+def _confidence(item: dict) -> float:
+    """The LLM's confidence as a number; a missing or malformed value counts as no confidence."""
+    try:
+        return float(item.get("confidence", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_list(value: object) -> list:
+    """The LLM may return null for a list it was told it can omit."""
+    return value if isinstance(value, list) else []
 
 
 def _page_text(page: dict) -> str:
@@ -121,7 +135,7 @@ def content_classification(state: ProcessState) -> dict:
                 if not isinstance(item, dict) or not item.get("type"):
                     continue
                 old = best_types.get(item["type"])
-                if old is None or float(item.get("confidence", 0)) > float(old.get("confidence", 0)):
+                if old is None or _confidence(item) > _confidence(old):
                     best_types[item["type"]] = item
         result = {
             "is_relevant": any(bool(p.get("is_relevant")) for p in partials),
@@ -161,7 +175,7 @@ def is_relevant_content(state: ProcessState) -> str:
     """Conditional edge: irrelevant (including faculty / other / low confidence) -> discard; relevant -> Node 6."""
     cls = state.get("classification") or {}
     keep_types = [t for t in cls.get("types", [])
-                  if t["type"] in KEEP_TYPES and float(t.get("confidence", 0)) >= CONFIDENCE_THRESHOLD]
+                  if t["type"] in KEEP_TYPES and _confidence(t) >= CONFIDENCE_THRESHOLD]
     if cls.get("is_relevant") and keep_types:
         return "identify_programs"
     return "discard_page"
@@ -329,7 +343,7 @@ def _merge_extractions(parts: list[dict]) -> dict:
     for part in parts:
         if not isinstance(part, dict):
             continue
-        for program in part.get("programs", []):
+        for program in _as_list(part.get("programs")):
             if not isinstance(program, dict) or not program.get("program_code"):
                 continue
             code = program["program_code"]
@@ -338,7 +352,8 @@ def _merge_extractions(parts: list[dict]) -> dict:
                 target = {"program_code": code, "fields": {}}
                 programs_by_code[code] = target
                 merged["programs"].append(target)
-            for field, field_value in (program.get("fields") or {}).items():
+            fields = program.get("fields")
+            for field, field_value in (fields if isinstance(fields, dict) else {}).items():
                 current = target["fields"].get(field)
                 if current is None or (isinstance(current, dict) and current.get("value") is None):
                     target["fields"][field] = field_value
@@ -346,7 +361,7 @@ def _merge_extractions(parts: list[dict]) -> dict:
         for list_name in ("deadlines", "scholarships", "app_materials", "evidence_paragraphs"):
             existing_by_key = {_list_item_key(list_name, item): item
                                for item in merged[list_name]}
-            for item in part.get(list_name, []):
+            for item in _as_list(part.get(list_name)):
                 if not isinstance(item, dict):
                     continue
                 key = _list_item_key(list_name, item)
@@ -364,23 +379,19 @@ def _normalize_target_codes(extraction: dict, program_codes: list[str]) -> dict:
     if not isinstance(extraction, dict) or not program_codes:
         return extraction if isinstance(extraction, dict) else {}
     target = program_codes[0]
-    for program in extraction.get("programs", []):
+    for program in _as_list(extraction.get("programs")):
         if isinstance(program, dict):
             program["program_code"] = target
     for list_name in ("deadlines", "scholarships", "app_materials", "evidence_paragraphs"):
-        for item in extraction.get(list_name, []):
+        for item in _as_list(extraction.get(list_name)):
             if isinstance(item, dict):
                 item["program_code"] = target
     return extraction
 
 
-
-
 def structured_extraction(state: ProcessState) -> dict:
     page = state["page"]
     codes = [p["program_code"] for p in state.get("program_codes", [])]
-    codes.sort(key=lambda code: (not any(degree in code.upper().split()
-                                         for degree in ("MS", "MSC", "MENG", "MCS", "MDS")), code))
     markdown = _page_text(page)
     if page.get("structured_tables"):
         markdown = markdown + "\n\n## Tables\n" + page["structured_tables"]
@@ -398,13 +409,12 @@ def structured_extraction(state: ProcessState) -> dict:
     for index, chunk in enumerate(chunks, start=1):
         if llm_is_unavailable():
             break
-        # Every segment is passed in full. Keywords no longer cut out text that did not match, so the LLM judges by the context.
-        focused_chunk = chunk
+        # Every segment is passed in full, so the LLM judges by the context.
         try:
             extraction = call_llm_json(extraction_prompt(
                 page["url"], codes,
                 f"[Part {index}/{len(chunks)} of the same web page; context relevant to the fields is kept]\n"
-                f"{focused_chunk}", feedback,
+                f"{chunk}", feedback,
             ))
             if isinstance(extraction, dict):
                 extractions.append(_normalize_target_codes(extraction, codes))
@@ -416,11 +426,6 @@ def structured_extraction(state: ProcessState) -> dict:
     extraction = _promote_grounded_evidence(_merge_extractions(extractions))
     if len(chunks) > 1:
         print(f"  [extraction] {page['url']} -> {len(chunks)} segments merged")
-    field_names = sorted({
-        field
-        for program in extraction.get("programs", [])
-        for field in (program.get("fields") or {})
-    })
 
     return {"extraction": extraction,
             "extraction_retries": state.get("extraction_retries", 0) + 1}
@@ -463,23 +468,20 @@ def _value_supported_by_excerpt(value, excerpt: str) -> bool:
     if not digits:
         return True  # plain-text fields only require that the excerpt exists
     ex = excerpt or ""
-    ex_digits = set(_digits_of(ex))
+    # Compare whole numbers, not substrings: 3 must not be "found" in 2023, nor 7 in 7.5, nor 85 in 850.
+    ex_numbers = {float(n) for n in _digits_of(ex)}
+    number_words = {
+        0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
+        5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine",
+        10: "ten", 11: "eleven", 12: "twelve",
+    }
 
     def present(d: str) -> bool:
-        if d in ex_digits or d in ex:
+        number = float(d)
+        if number in ex_numbers:
             return True
-        # Tolerate 3.0 vs 3, 3.50 vs 3.5
-        if "." in d:
-            trimmed = d.rstrip("0").rstrip(".")
-            return trimmed in ex_digits or trimmed in ex
-        number_words = {
-            "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
-            "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
-            "10": "ten", "11": "eleven", "12": "twelve",
-        }
-        if number_words.get(d) and re.search(rf"\b{number_words[d]}\b", ex, re.I):
-            return True
-        return False
+        word = number_words.get(number) if number.is_integer() else None
+        return bool(word and re.search(rf"\b{word}\b", ex, re.I))
 
     # Date YYYY-MM-DD: require the year, the English month and the day to appear in the same date fragment.
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value)):
@@ -626,7 +628,10 @@ def _promote_grounded_evidence(extraction: dict) -> dict:
             low,
         ):
             month_name, day, year = match.groups()
-            date_value = f"{year}-{_MONTH_VALUES[month_name]:02d}-{int(day):02d}"
+            try:
+                date_value = date(int(year), _MONTH_VALUES[month_name], int(day)).isoformat()
+            except ValueError:      # such as "February 30"
+                continue
             if (code, date_value) in existing_deadlines:
                 continue
             nearby = low[max(0, match.start() - 80):match.end() + 80]
@@ -798,9 +803,9 @@ def hallucination_validation(state: ProcessState) -> dict:
 
 
 def extraction_quality_check(state: ProcessState) -> str:
+    """Do at least one semantic correction against the original text; if problems remain, correct at most once more."""
     if llm_is_unavailable():
         return 'finalize_page'
-    """Do at least one semantic correction against the original text; if problems remain, correct at most once more."""
     validation = state.get("validation") or {}
     repairs = state.get("validation_repair_retries", 0)
     if repairs == 0 or (not validation.get("passed") and repairs < MAX_VALIDATION_REPAIRS):
@@ -841,6 +846,7 @@ def semantic_repair(state: ProcessState) -> dict:
     print(f"  [validation repair] {page['url']} -> {len(parts)} segments corrected")
     return {
         "extraction": repaired,
+        "rejected_issues": [*state.get("rejected_issues", []), *issues],
         "validation_repair_retries": state.get("validation_repair_retries", 0) + 1,
     }
 
@@ -852,6 +858,9 @@ def semantic_repair(state: ProcessState) -> dict:
 def _strip_invalid_fields(extraction: dict, issues: list[dict]) -> dict:
     """Remove the fields that failed validation from the extraction result (they go to review_queue, not the official tables)."""
     bad = {(i.get("program_code"), i.get("field_name")) for i in issues}
+    # Items of a list share a label such as deadlines[regular], so an item is identified by its excerpt too;
+    # a rejected Fall deadline must not take the valid Spring deadline with it.
+    bad_items = {(i.get("program_code"), i.get("field_name"), i.get("source_excerpt", "")) for i in issues}
     out = {"programs": [], "deadlines": [], "scholarships": [],
            "app_materials": [], "evidence_paragraphs": []}
 
@@ -865,7 +874,7 @@ def _strip_invalid_fields(extraction: dict, issues: list[dict]) -> dict:
     for list_name in ("deadlines", "scholarships", "app_materials"):
         for item in extraction.get(list_name, []):
             label = f"{list_name}[{item.get('deadline_type') or item.get('name') or item.get('material_type') or '?'}]"
-            if (item.get("program_code"), label) not in bad:
+            if (item.get("program_code"), label, item.get("source_excerpt", "")) not in bad_items:
                 out[list_name].append(item)
     out["evidence_paragraphs"] = [
         item for item in extraction.get("evidence_paragraphs", [])
@@ -974,12 +983,18 @@ def finalize_page(state: ProcessState) -> dict:
     _append_issue_evidence(extraction, issues, page)
     # Explicit values that are only turned into evidence at the last validation also get a chance to return to the official fields.
     extraction = _promote_grounded_evidence(extraction)
-    unresolved_issues = [
-        issue for issue in issues
-        if not _issue_resolved_by_extraction(issue, extraction)
-    ]
+    # The repair step removes rejected values before the next validation, so the last validation alone would
+    # report nothing. Every rejection of this page goes to review unless a grounded value replaced it.
+    unresolved_issues = []
+    seen_issues = set()
+    for issue in [*state.get("rejected_issues", []), *issues]:
+        key = (issue.get("program_code"), issue.get("field_name"),
+               str(issue.get("field_value")), issue.get("source_excerpt"))
+        if key not in seen_issues and not _issue_resolved_by_extraction(issue, extraction):
+            seen_issues.add(key)
+            unresolved_issues.append(issue)
 
-    passed_types = [{"type": t["type"], "score": round(float(t.get("confidence", 0)), 2)}
+    passed_types = [{"type": t["type"], "score": round(_confidence(t), 2)}
                     for t in cls.get("types", []) if t["type"] in KEEP_TYPES]
 
     review_items = [

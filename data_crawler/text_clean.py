@@ -39,7 +39,8 @@ def clean_noise(text: str) -> str:
     """Apply the keyword-removal list from config/cleaning.py."""
     if not text:
         return text
-    return remove_keywords(text, KEYWORDS_TO_REMOVE)
+    # PostgreSQL text columns cannot store NUL, which PDF text can contain.
+    return remove_keywords(text.replace("\x00", ""), KEYWORDS_TO_REMOVE)
 
 
 def content_hash(text: str) -> str:

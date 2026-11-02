@@ -48,7 +48,7 @@ Main graph (SchoolState, thread_id = school_id, PostgresSaver)
                                   visited URLs live in state, so a resume does not re-crawl
   Node 3   URL filter             batch language-model judgment of the level's candidate URLs
   Node 4   scrape_page            fan-out, one branch per page, limited by NUM_WORKERS
-           collect_scraped        content-hash deduplication, drops error pages
+           collect_scraped        final-URL deduplication, drops error pages and off-site redirects
   Node 5-8 process_page           fan-out into the page subgraph (below)
   Node 9   sufficiency_evaluator  rule-based coverage report
   Node 10  tagging                rule-based type and program codes
@@ -62,10 +62,12 @@ Page subgraph (ProcessState)
      irrelevant, faculty, or low confidence -> discard_page
   Node 6   identify_programs        decides whether the page applies to the international CS master's
   Node 7   structured_extraction    extracts fields from structured markdown, each with a source_excerpt
-  Node 8   hallucination_validation compares field by field: the excerpt must exist in the page text,
+  Node 8   hallucination_validation compares field by field: the excerpt must be grounded in the page text
+                                    (found verbatim, or at least 55% of its meaningful words occur on the page),
                                     and numbers or dates must appear inside the excerpt
-     problem and retries <= 2 -> back to Node 7
-     over the limit -> the field goes to review_queue, and its grounded context is kept in program_evidence
+           semantic_repair          removes rejected values, keeps their grounded context in program_evidence, and
+                                    asks the language model to correct or fill fields; runs once or twice, then back to Node 8
+           finalize_page            a rejected value goes to review_queue unless a grounded value replaced it
 ```
 
 Node 3 prefers pages about English-language thresholds, checklists, international applicants, application fees and deadlines; it down-weights joint-degree and BS/MS pages and excludes current-student and current-fellowship pages.
@@ -93,7 +95,7 @@ The interface is an `openai.OpenAI` singleton configured from `backend/.env`. Se
 2. `GROQ_API_KEY` uses Groq's OpenAI-compatible endpoint (`GROQ_MODEL`, default `llama-3.3-70b-versatile`).
 3. `GOOGLE_API_KEY` uses Gemini's OpenAI-compatible endpoint (`GEMINI_MODEL`, default `gemini-2.5-flash`).
 
-Structured calls use JSON mode with temperature 0. Concurrency is limited by a semaphore (`LLM_MAX_CONCURRENCY`, default 2), and a 429 response triggers a backoff that follows the API's suggested delay, up to five retries.
+Structured calls use JSON mode with temperature 0. Concurrency is limited by a semaphore (`LLM_MAX_CONCURRENCY`, default 2), and a 429 response triggers a backoff that follows the API's suggested delay, up to five attempts.
 
 ## 5. Database behavior
 
@@ -111,19 +113,19 @@ Everything the crawler is tuned by lives in the `data_crawler/config/` package:
 | File | Content |
 |---|---|
 | `config/parameter.py` | `CONFIG`, page hints, thresholds, user agent |
-| `config/blacklist.py` | ignored extensions and path fragments |
-| `config/root_url.py` | per-school root URLs (`SCHOOLS`) |
+| `config/blacklist.py` | ignored file extensions |
+| `config/root_url.py` | per-school names and root URLs (`SCHOOLS`) |
 | `config/cleaning.py` | keyword list used to clean page text |
 
-To add a school, add its roots to `config/root_url.py`, and add its aliases to `_SCHOOL_ALIASES` in `backend/scripts/retriever/agent/state.py` so the agent can recognize it.
+To add a school, add its name and roots to `config/root_url.py`, and add its aliases to `SCHOOL_ALIASES` in `backend/retriever/school_aliases.py` so the agent can recognize it.
 
 ## 7. Known limitations
 
 1. **Faculty pages are not processed.** They are classified and discarded; the `professors` table is filled from a faculty list you provide instead.
 2. **One target model.** Only `INTERNATIONAL_CS_MASTERS` is created per school. University-level and department-level rules are merged into one record, and no program is invented when an official CS page says there is no terminal master's.
-3. **Re-running a thread accumulates state.** LangGraph accumulator channels cannot be reset, so a run without `--resume` on an existing thread opens a new `{school_id}-{timestamp}` thread.
+3. **Re-running a thread accumulates state.** LangGraph accumulator channels cannot be reset, so a run without `--resume` on an existing thread opens a new `{school_id}-{timestamp}` thread and prints the `--resume --thread-id` command that continues it.
 4. **Rate limits.** Free-tier providers can throttle a large fan-out. Concurrency limits and backoff recover automatically, but overall speed is bounded by the quota.
 5. **Deadlines.** A date without an explicit year is not guessed; it is stored in `program_evidence`. Duplicates across pages and extended deadlines still need school-level merging.
-6. **No `robots.txt` check.** The blacklist is maintained by hand. Respect each site's terms of use.
-7. **PDFs.** The blacklist blocks `.pdf` in the BFS stage, so the PDF branch only applies to seed URLs or when `filter_url(allow_pdf=True)` is used.
+6. **No `robots.txt` check.** Respect each site's terms of use.
+7. **PDFs.** `config/blacklist.py` blocks `.pdf` in the BFS stage, so the PDF branch only applies to seed URLs or when `filter_url(allow_pdf=True)` is used.
 8. **Checkpoint granularity.** BFS checkpoints per level. The scrape and process fan-outs are single supersteps: branches that finished before an interruption keep their results, and unfinished branches run again.

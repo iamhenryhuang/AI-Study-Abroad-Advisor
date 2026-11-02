@@ -21,15 +21,16 @@ class CrawlConfig:
 CONFIG = CrawlConfig()
 
 
+# Reference scores for the LLM page classifier. Matched as substrings of the lowercased URL path.
 URL_PATH_HINTS = {
     "admissions": [
         ("admissions", 6), ("admission", 3.5), ("apply", 5),
         ("application", 4), ("how-to-apply", 5), ("how_to_apply", 5),
         ("checklist", 4), ("requirements", 5), ("eligibility", 10),
-        ("program", 3), ("undergradute", -5), ("phd", -3), ("prospective", 3),
-        ("english-language-proficiency", 8), ("proficiency", 4), ("PhD", -3),
+        ("program", 3), ("undergraduate", -5), ("phd", -3), ("prospective", 3),
+        ("english-language-proficiency", 8), ("proficiency", 4),
         ("international-applicants", 8), ("guidelines", 4), ("international", 8),
-        ("check", 5), ("ready-to-apply", 6), ("Page Not Found", -10), ("fellowships", 4),
+        ("check", 5), ("ready-to-apply", 6), ("fellowships", 4),
         ("tips-for-applying", 5), ("international/ready-to-apply", 10),
         ("international/before-to-apply", 10), ("domestic/before-to-apply", 10),
         ("/domestic/ready-you-apply", 10), ("step", 4), ("process", 6),
@@ -38,18 +39,17 @@ URL_PATH_HINTS = {
     "program": [
         ("grad_cs", 5), ("graduate", 5), ("ms-program", 5),
         ("ms_program", 5), ("degree", 8), ("curriculum", 4),
-        ("degree-programs", 5), ("degree_programs", 5), ("undergradute", -5),
-        ("program", 4), ("computer science", 3), ("Page Not Found", -10),
+        ("degree-programs", 5), ("degree_programs", 5), ("undergraduate", -5),
+        ("program", 4), ("computer-science", 3),
     ],
     "tuition": [
         ("tuition", 10), ("financial", 10), ("financial-assistance", 5),
         ("financial_assistance", 5), ("cost", 10), ("fees", 10),
         ("scholarship", 15), ("fellowships", 15), ("funding", 4),
-        ("reimbursement", 6), ("tax", 5), ("Page Not Found", -10),
+        ("reimbursement", 6), ("tax", 5),
     ],
     "faq": [
         ("faq", 8), ("faqs", 8), ("faq-applicants", 6),
         ("frequently-asked", 7), ("frequently_asked", 6),
-        ("Page Not Found", -10),
     ],
 }

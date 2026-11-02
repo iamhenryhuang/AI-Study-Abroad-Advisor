@@ -2,7 +2,7 @@
 
 Main graph (SchoolState, thread_id = school_id):
   init_crawl ─▶ discover_urls ─▶ filter_discovered_urls(batch LLM) ⟲
-      └▶ plan_scrape ═Send═▶ scrape_page(Node 4) ─▶ collect_scraped (content-hash dedup)
+      └▶ plan_scrape ═Send═▶ scrape_page(Node 4) ─▶ collect_scraped (final-URL dedup)
       └▶ ═Send═▶ process_page (page subgraph) ─▶ sufficiency_evaluator(Node 9)
             └─ coverage report ─▶ tagging ─▶ chunking ─▶ embedding
                                                 ─▶ db_writer ─▶ finalize_school
@@ -18,8 +18,8 @@ Page subgraph (ProcessState):
 from langgraph.graph import StateGraph, START, END
 
 from .state import SchoolState, ProcessState
-from . import nodes_school as ns
-from . import nodes_page as np_
+from .nodes import page as np_
+from .nodes import school as ns
 
 
 def build_page_subgraph():

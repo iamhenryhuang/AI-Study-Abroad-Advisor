@@ -112,6 +112,13 @@ def extract_links(page, current_url: str, root_info: dict) -> dict:
     return {"keep": keep, "keep_anchors": keep_anchors, "drop": drop, "external": external}
 
 
+def _goto(page, url: str) -> None:
+    """Open a URL, treating an HTTP error status as a failure so a 404 page is never processed as content."""
+    response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    if response is not None and response.status >= 400:
+        raise RuntimeError(f"HTTP {response.status}")
+
+
 def crawl_page(page, url: str, root_info: dict) -> dict:
     result = {
         "url": url, "title": "",
@@ -119,7 +126,7 @@ def crawl_page(page, url: str, root_info: dict) -> dict:
         "error": None,
     }
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        _goto(page, url)
         try:
             page.wait_for_load_state("networkidle", timeout=3000)
         except PlaywrightTimeoutError:
@@ -468,7 +475,7 @@ def _html_to_markdown(html: str, url: str) -> str:
 def extract_page_content_with_js(page, url, extra_wait_ms=3000):
     """Extracts the page text, plus structured_markdown / structured_tables / content_hash."""
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        _goto(page, url)
         try:
             page.wait_for_load_state("networkidle", timeout=10000)
         except PlaywrightTimeoutError:

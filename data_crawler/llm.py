@@ -1,6 +1,6 @@
 """LLM calls -- reusing the project's existing way of calling and its keys:
 
-- The SDK and interface follow backend/scripts/generator/client.py (an openai.OpenAI singleton)
+- The SDK and interface follow backend/generator/client.py (an openai.OpenAI singleton)
 - Keys come from backend/.env; three providers are supported (Groq/Gemini go through OpenAI-compatible endpoints):
     * openai -> OPENAI_API_KEY (model OPENAI_MODEL, default gpt-4.1)
     * groq   -> GROQ_API_KEY (model GROQ_MODEL, default llama-3.3-70b-versatile,
@@ -16,12 +16,13 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Same as backend/scripts/database/connection.py: load backend/.env (the root .env is tolerated too)
+# Same as the backend: load backend/.env (the root .env is tolerated too)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
 load_dotenv(_PROJECT_ROOT / "backend" / ".env")
@@ -38,7 +39,7 @@ _LLM_SEMAPHORE = threading.Semaphore(int(os.getenv("LLM_MAX_CONCURRENCY", "2")))
 _PROVIDERS = {
     "openai": {
         "key_env": "OPENAI_API_KEY",
-        # Official OpenAI by default; set OPENAI_BASE_URL to use a compatible proxy (such as myai168)
+        # Official OpenAI by default; set OPENAI_BASE_URL to use a compatible endpoint
         "base_url": os.getenv("OPENAI_BASE_URL") or None,
         "model": lambda: os.getenv("OPENAI_MODEL", "gpt-4.1"),
     },
@@ -50,7 +51,6 @@ _PROVIDERS = {
     "gemini": {
         "key_env": "GOOGLE_API_KEY",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        # Default 2.5-flash: in testing this key's gemini-2.0-flash free quota is 0
         "model": lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
     },
 }
@@ -147,16 +147,6 @@ def get_openai_client() -> OpenAI:
     return _client
 
 
-def call_llm(prompt: str, model_name: str = DEFAULT_MODEL, system: str | None = None) -> str:
-    client = get_openai_client()
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    response = client.chat.completions.create(model=model_name, messages=messages)
-    return (response.choices[0].message.content or "").strip()
-
-
 def _extract_json(text: str):
     """Tolerant parsing: try json.loads directly, then fish a ```json fence or the first {...}/[...] out of the text."""
     text = text.strip()
@@ -189,8 +179,6 @@ def call_llm_json(prompt: str, model_name: str = DEFAULT_MODEL, system: str | No
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-
-    import time
 
     last_err = None
     for attempt in range(MAX_LLM_RETRY + 1):

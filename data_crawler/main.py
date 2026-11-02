@@ -71,12 +71,15 @@ def main():
         with PostgresSaver.from_conn_string(database_url) as checkpointer:
             checkpointer.setup()
             app = build_school_graph(checkpointer)
+            if args.resume and checkpointer.get(config) is None:
+                print(f"[WARN] Thread '{thread_id}' has no checkpoint to resume; starting from scratch")
+                graph_input = initial_state
             # A fresh non-resume run: if the same thread already has old records, open a new thread,
             # so accumulating state (page_results etc.) does not pile up across runs
             if not args.resume and checkpointer.get(config) is not None:
-                thread_id = f"{args.school_id}-{datetime.now():%Y%m%d%H%M%S}"
-                print(f"[INFO] Thread '{args.school_id}' already has earlier run records; using thread_id={thread_id} this time"
-                      f" (add --resume to continue the old run)")
+                thread_id = f"{thread_id}-{datetime.now():%Y%m%d%H%M%S}"
+                print(f"[INFO] This thread already has earlier run records; using thread_id={thread_id} this time. "
+                      f"If this run is interrupted, continue it with --resume --thread-id {thread_id}")
                 config = {"configurable": {"thread_id": thread_id},
                           "recursion_limit": RECURSION_LIMIT}
             final_state = app.invoke(graph_input, config)

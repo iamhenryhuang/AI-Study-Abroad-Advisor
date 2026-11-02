@@ -7,19 +7,21 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+import psycopg
 from langgraph.types import Send
 
-from .config import CONFIG, SCHOOLS
-from .state import SchoolState, ScrapeState
-from .url_tools import normalize_url, application_scope_exclusion
-from .browser import crawl_one_layer, scrape_url
-from .text_clean import clean_noise
-from .llm import call_llm_json
-from .prompts import url_filter_prompt
-from . import db as dbm
+from .. import db as dbm
+from ..browser import crawl_one_layer, scrape_url
+from ..config import CONFIG, SCHOOLS
+from ..llm import call_llm_json
+from ..prompts import url_filter_prompt
+from ..state import SchoolState, ScrapeState
+from ..text_clean import clean_noise
+from ..url_tools import normalize_url, application_scope_exclusion
 
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-URL_RESULT_DIR = Path(__file__).resolve().parent / "url"
+CRAWLER_DIR = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = CRAWLER_DIR / "output"
+URL_RESULT_DIR = CRAWLER_DIR / "url"
 
 URL_FILTER_BATCH_SIZE = max(1, int(os.getenv("URL_FILTER_BATCH_SIZE", "40")))
 
@@ -55,20 +57,49 @@ def _crawl_candidate_priority(item: dict) -> tuple:
     return (-score, item.get("root_index", 0), item.get("url", ""))
 
 
+def _school_config(school_id: str) -> dict:
+    school = next((s for s in SCHOOLS if s["school_id"] == school_id), None)
+    if school is None:
+        raise ValueError(f"school_id={school_id} not found in config/root_url.py")
+    return school
+
+
+def _registrable_domain(netloc: str) -> str:
+    parts = netloc.lower().split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
+
+
+def _url_domain(url: str) -> str:
+    return _registrable_domain(urlparse(url).netloc)
+
+
+def _allowed_domains(school: dict) -> set[str]:
+    """The official domains of a school, taken from its configured roots."""
+    return {_url_domain(root) for root in school.get("roots", []) if root and root.startswith("http")}
+
+
+def _university_identity(school: dict) -> tuple[str | None, str | None]:
+    """The (name, domain) to store in universities."""
+    domains = sorted(_allowed_domains(school))
+    return school.get("name"), (domains[0] if len(domains) == 1 else None)
+
+
 # ──────────────────────────────────────────────
 # Node 1: init_crawl
 # ──────────────────────────────────────────────
 
 def init_crawl(state: SchoolState) -> dict:
     school_id = state["school_id"]
-    school = next((s for s in SCHOOLS if s["school_id"] == school_id), None)
-    if school is None:
-        raise ValueError(f"school_id={school_id} not found in config/root_url.py")
+    school = _school_config(school_id)
 
     configured_roots = state.get("root_urls_override") or school["roots"]
     roots = [normalize_url(r) for r in configured_roots if r and r.startswith("http")]
     if not roots:
         raise ValueError(f"school_id={school_id} has no valid root URL")
+    # db_writer refuses URLs outside the school's domains; fail now rather than after the whole crawl.
+    foreign_roots = [r for r in roots if _url_domain(r) not in _allowed_domains(school)]
+    if foreign_roots:
+        raise ValueError(f"--root-url is outside the domains of {school_id}: {foreign_roots}")
     max_depth = state.get("max_depth")
     max_depth = CONFIG.MAX_DEPTH if max_depth is None else max_depth
     max_pages = state.get("max_pages")
@@ -82,7 +113,7 @@ def init_crawl(state: SchoolState) -> dict:
         conn = dbm.get_connection()
         try:
             dbm.ensure_migrations(conn)
-            university_id = dbm.get_or_create_university(conn, school_id)
+            university_id = dbm.get_or_create_university(conn, school_id, *_university_identity(school))
             known_codes = dbm.list_known_program_codes(conn, university_id)
             hours = state.get("skip_recent_hours") or 0
             if hours > 0 and dbm.school_recently_extracted(conn, university_id, hours):
@@ -169,7 +200,7 @@ def discover_urls(state: SchoolState) -> dict:
                         "root_index": root_index_by_url.get(url, 0),
                     }
 
-    # Drop statistics (reusing the level summary of crawl_tree)
+    # Drop statistics for this level
     reasons: dict = {}
     for _, _, r in layer_results:
         for reason in r["drop"].values():
@@ -381,7 +412,7 @@ def scrape_page(state: ScrapeState) -> dict:
 
 
 def collect_scraped(state: SchoolState) -> dict:
-    """Deduplicate by final URL and filter out error pages; the content hash is only for diagnosis and never drops data across URLs.
+    """Deduplicate by final URL and filter out error pages and off-site redirects; the content hash is only for diagnosis and never drops data across URLs.
 
     Different official pages can end up with the same or an empty content_hash because of a shared template, a failed load,
     or an old checkpoint that lacks the hash. Deduplicating across URLs by hash directly would lose admissions requirements,
@@ -390,12 +421,18 @@ def collect_scraped(state: SchoolState) -> dict:
     first_url_by_hash: dict[str, str] = {}
     seen_urls: set[str] = set()
     unique = []
+    allowed_domains = _allowed_domains(_school_config(state["school_id"]))
 
     for rec in state.get("scraped_pages", []):
         if rec.get("error") or not rec.get("full_text"):
             continue
         requested_url = rec.get("requested_url") or rec["url"]
         effective_url = normalize_url(rec.get("final_url") or rec["url"])
+        # An official link can redirect to a third-party application portal. That page is not official
+        # text of this school, and db_writer would otherwise abort the whole school because of it.
+        if _url_domain(effective_url) not in allowed_domains:
+            print(f"  [SKIP] off-site redirect: {requested_url[:70]} -> {effective_url[:70]}")
+            continue
         if effective_url in seen_urls:
             print(f"  [SKIP] redirect alias: {requested_url[:70]} -> {effective_url[:70]}")
             continue
@@ -462,11 +499,6 @@ def _coverage_report(page_results: list[dict]) -> dict:
             ],
         }
     return report
-
-
-def _registrable_domain(netloc: str) -> str:
-    parts = netloc.lower().split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
 
 
 def sufficiency_evaluator(state: SchoolState) -> dict:
@@ -556,8 +588,9 @@ def embedding(state: SchoolState) -> dict:
         return {}
 
     from sentence_transformers import SentenceTransformer
-    model_path = os.getenv("BGE_EMBED_MODEL_PATH", "BAAI/bge-m3")
-    model = SentenceTransformer(model_path)
+    # An empty env var (BGE_EMBED_MODEL_PATH= in .env) counts as unset. Same loading as backfill_embeddings.py.
+    model_path = os.getenv("BGE_EMBED_MODEL_PATH") or "BAAI/bge-m3"
+    model = SentenceTransformer(model_path, trust_remote_code=True)
 
     chunks = state.get("chunks", [])
     texts = [c["text"] for c in chunks]
@@ -575,14 +608,7 @@ def embedding(state: SchoolState) -> dict:
 def _validate_school_write_scope(state: SchoolState, ok_results: list[dict]) -> None:
     """Stop a school-A URL from being written into school B when the checkpoint/state gets mixed up."""
     school_id = state["school_id"]
-    school = next((item for item in SCHOOLS if item["school_id"] == school_id), None)
-    if not school:
-        raise RuntimeError(f"DB write aborted: no root configuration found for school_id={school_id}")
-
-    allowed_domains = {
-        _registrable_domain(urlparse(root).netloc)
-        for root in school.get("roots", []) if root and root.startswith("http")
-    }
+    allowed_domains = _allowed_domains(_school_config(school_id))
     if not allowed_domains:
         raise RuntimeError(f"DB write aborted: school_id={school_id} has no valid root domain")
 
@@ -592,7 +618,7 @@ def _validate_school_write_scope(state: SchoolState, ok_results: list[dict]) -> 
         *(chunk.get("url", "") for chunk in state.get("chunks", [])),
     ]
     invalid = [url for url in scoped_urls
-               if url and _registrable_domain(urlparse(url).netloc) not in allowed_domains]
+               if url and _url_domain(url) not in allowed_domains]
     if invalid:
         samples = ", ".join(invalid[:5])
         raise RuntimeError(
@@ -654,13 +680,25 @@ def db_writer(state: SchoolState) -> dict:
 
     conn = dbm.get_connection()
     # Do not trust a university_id in the checkpoint that may be stale; resolve it again from school_id on every write.
-    university_id = dbm.get_or_create_university(conn, school_id)
+    university_id = dbm.get_or_create_university(conn, school_id, *_university_identity(_school_config(school_id)))
     stale_id = state.get("university_id")
     if stale_id is not None and stale_id != university_id:
         print(f"  [WARN] stale university_id corrected: state={stale_id} db={university_id} ({school_id})")
     stats = {"pages": 0, "programs": 0, "global_extractions": 0,
              "deadlines": 0, "scholarships": 0,
-             "materials": 0, "evidence": 0, "review": 0, "chunks": 0}
+             "materials": 0, "evidence": 0, "review": 0, "chunks": 0, "write_errors": 0}
+
+    def write_row(stat: str, write, *args) -> None:
+        """One value the database rejects (an invalid date from the LLM, an over-long string) must not abort
+        the write of the whole school, or a resume would hit the same value forever. It stays in the audit JSON."""
+        try:
+            write(conn, *args)
+            stats[stat] += 1
+        except psycopg.Error as exc:
+            conn.rollback()
+            stats["write_errors"] += 1
+            print(f"  [WARN] {write.__name__} skipped a row: {exc}")
+
     chunks_by_url: dict[str, list] = {}
     for c in state.get("chunks", []):
         chunks_by_url.setdefault(c["url"], []).append(c)
@@ -804,29 +842,25 @@ def db_writer(state: SchoolState) -> dict:
                         )
                         stats["global_extractions"] += 1
 
-            # Child tables: look up, then decide insert/update (v4 3-1); filter out empty-shell rows with no real content
+            # Child tables: look up, then decide insert/update; filter out empty-shell rows with no real content
             for d in ext.get("deadlines", []):
                 pid = program_id_by_code.get(d.get("program_code"))
                 if pid and (d.get("deadline_date") or d.get("application_open_date") or d.get("application_close_date")
                             or d.get("decision_release_date")
                             or (d.get("semester") and d.get("note"))):
-                    dbm.upsert_deadline(conn, pid, d)
-                    stats["deadlines"] += 1
+                    write_row("deadlines", dbm.upsert_deadline, pid, d)
             for s in ext.get("scholarships", []):
                 pid = program_id_by_code.get(s.get("program_code"))
                 if pid and s.get("name"):
-                    dbm.upsert_scholarship(conn, pid, s, r["url"])
-                    stats["scholarships"] += 1
+                    write_row("scholarships", dbm.upsert_scholarship, pid, s, r["url"])
             for m in ext.get("app_materials", []):
                 pid = program_id_by_code.get(m.get("program_code"))
                 if pid and m.get("material_type") and (m.get("requirement") or m.get("note")):
-                    dbm.upsert_app_material(conn, pid, m)
-                    stats["materials"] += 1
+                    write_row("materials", dbm.upsert_app_material, pid, m)
             for evidence in ext.get("evidence_paragraphs", []):
                 pid = program_id_by_code.get(evidence.get("program_code"))
                 if pid and evidence.get("evidence_text"):
-                    dbm.upsert_program_evidence(conn, pid, evidence, r["url"])
-                    stats["evidence"] += 1
+                    write_row("evidence", dbm.upsert_program_evidence, pid, evidence, r["url"])
 
             # document_chunks
             page_chunks = chunks_by_url.get(r["url"], [])
@@ -846,8 +880,7 @@ def db_writer(state: SchoolState) -> dict:
                     if item.get("field_value") is not None \
                             and accepted_key in accepted_program_values:
                         continue
-                    dbm.insert_review_item(conn, university_id, page_id, item)
-                    stats["review"] += 1
+                    write_row("review", dbm.insert_review_item, university_id, page_id, item)
 
         # School-wide deadlines / scholarships / materials are also distributed to the confirmed programs.
         for result in common_results:
@@ -858,24 +891,19 @@ def db_writer(state: SchoolState) -> dict:
                             item.get("deadline_date") or item.get("application_open_date") or item.get("application_close_date")
                             or item.get("decision_release_date")
                             or (item.get("semester") and item.get("note"))):
-                        dbm.upsert_deadline(conn, pid, {**item, "program_code": code})
-                        stats["deadlines"] += 1
+                        write_row("deadlines", dbm.upsert_deadline, pid, {**item, "program_code": code})
                 for item in ext.get("scholarships", []):
                     if item.get("program_code") in ("SCHOOL_WIDE", "CS_DEPARTMENT_WIDE") and item.get("name"):
-                        dbm.upsert_scholarship(conn, pid, {**item, "program_code": code}, result["url"])
-                        stats["scholarships"] += 1
+                        write_row("scholarships", dbm.upsert_scholarship, pid, {**item, "program_code": code}, result["url"])
                 for item in ext.get("app_materials", []):
                     if item.get("program_code") in ("SCHOOL_WIDE", "CS_DEPARTMENT_WIDE") and item.get("material_type") and (
                             item.get("requirement") or item.get("note")):
-                        dbm.upsert_app_material(conn, pid, {**item, "program_code": code})
-                        stats["materials"] += 1
+                        write_row("materials", dbm.upsert_app_material, pid, {**item, "program_code": code})
                 for item in ext.get("evidence_paragraphs", []):
                     if (item.get("program_code") in ("SCHOOL_WIDE", "CS_DEPARTMENT_WIDE")
                             and item.get("evidence_text")):
-                        dbm.upsert_program_evidence(
-                            conn, pid, {**item, "program_code": code}, result["url"]
-                        )
-                        stats["evidence"] += 1
+                        write_row("evidence", dbm.upsert_program_evidence,
+                                  pid, {**item, "program_code": code}, result["url"])
     finally:
         conn.close()
 

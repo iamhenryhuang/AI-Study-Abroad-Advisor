@@ -1,7 +1,7 @@
 """The DB access layer of data_crawler.
 
-- The connection approach follows backend/scripts/database/connection.py (DATABASE_URL from .env + psycopg3).
-- db/schema_programs.sql is the single authoritative source for table creation; MIGRATION_SQL only does additive upgrades.
+- The connection approach follows backend/database/connection.py (DATABASE_URL from .env + psycopg3).
+- db/schema/crawler_tables.sql is the single authoritative source for table creation; MIGRATION_SQL only does additive upgrades.
 - When a structured field cannot be normalized safely, write it to program_evidence to keep the original text context.
 - deadlines / scholarships / app materials use a select-then-INSERT/UPDATE,
   and do not depend on extra UNIQUE constraints.
@@ -22,7 +22,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 MIGRATION_SQL = """
 -- Additive migration: never DROP any existing data.
 --
--- Table definitions are not written here -- db/schema_programs.sql (the single authoritative source) runs first in ensure_migrations(),
+-- Table definitions are not written here -- db/schema/crawler_tables.sql (the single authoritative source) runs first in ensure_migrations(),
 -- and this string only adds "column upgrades for an existing DB"; together the two bring a DB in any state to ready.
 -- If an old DB is still on an even earlier schema, the ALTERs below add the missing columns/types.
 
@@ -56,7 +56,7 @@ UPDATE program_scholarships  SET updated_at = created_at WHERE updated_at IS NUL
 UPDATE program_app_materials SET updated_at = created_at WHERE updated_at IS NULL;
 """
 
-# Columns of the programs table that the LLM extraction may write (matching init_db.sql)
+# Columns of the programs table that the LLM extraction may write (matching db/schema/crawler_tables.sql)
 PROGRAM_FIELDS = [
     "toefl_min", "toefl_ibt_min", "toefl_ibt_new_scale_min", "toefl_section_requirements",
     "ielts_min", "duolingo_min", "language_waiver", "english_test_notes",
@@ -69,6 +69,53 @@ PROGRAM_FIELDS = [
     "application_url", "application_system",
 ]
 
+# Column types of the fields above that need more than plain text. Keep in sync with crawler_tables.sql.
+_INTEGER_FIELDS = {
+    "toefl_min", "toefl_ibt_min", "duolingo_min", "gre_quant_min", "gre_verbal_min", "transcript_copies",
+    "rec_letter_count", "sop_word_limit", "application_fee_usd", "tuition_per_year_usd",
+}
+_BOOLEAN_FIELDS = {"cv_required", "writing_sample_required", "fee_waiver_available"}
+# Exclusive upper bound of each NUMERIC(p,s) column
+_NUMERIC_LIMITS = {"toefl_ibt_new_scale_min": 10, "ielts_min": 100, "gre_awa_min": 10, "gpa_min": 10}
+_VARCHAR_LIMITS = {"gre_required": 20, "gpa_scale": 10}
+
+
+def _storable_value(field: str, value):
+    """Convert an LLM value to what its column stores; raise ValueError if the column cannot store it."""
+    if field in _BOOLEAN_FIELDS:
+        if isinstance(value, bool):
+            return value
+        raise ValueError("not a boolean")
+    if field in _INTEGER_FIELDS or field in _NUMERIC_LIMITS:
+        if isinstance(value, bool):
+            raise ValueError("not a number")
+        number = float(value)
+        if field in _NUMERIC_LIMITS:
+            if not 0 <= number < _NUMERIC_LIMITS[field]:
+                raise ValueError("out of range for the column")
+            return number
+        if not number.is_integer() or abs(number) >= 2**31:
+            raise ValueError("not an integer")
+        return int(number)
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if len(text) > _VARCHAR_LIMITS.get(field, len(text)):
+        raise ValueError("too long for the column")
+    return text
+
+
+def _storable_fields(fields: dict) -> dict:
+    """The writable, non-null fields in storable form. A value the column cannot hold (such as a GPA of 85 in
+    NUMERIC(3,2)) is skipped with a warning rather than failing the other fields of the page; it stays in the audit JSON."""
+    storable = {}
+    for field, value in fields.items():
+        if field not in PROGRAM_FIELDS or value is None:
+            continue
+        try:
+            storable[field] = _storable_value(field, value)
+        except (TypeError, ValueError) as exc:
+            print(f"  [WARN] programs.{field} skipped the value {value!r}: {exc}")
+    return storable
+
 
 def get_connection():
     if not DATABASE_URL:
@@ -76,7 +123,7 @@ def get_connection():
     return psycopg.connect(DATABASE_URL, connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "5")))
 
 
-SCHEMA_PATH = _PROJECT_ROOT / "db" / "schema_programs.sql"
+SCHEMA_PATH = _PROJECT_ROOT / "db" / "schema" / "crawler_tables.sql"
 
 
 def ensure_migrations(conn) -> None:
@@ -87,17 +134,23 @@ def ensure_migrations(conn) -> None:
     conn.commit()
 
 
-def get_or_create_university(conn, school_id: str, name: str | None = None) -> int:
+def get_or_create_university(conn, school_id: str, name: str | None = None,
+                             domain: str | None = None) -> int:
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM universities WHERE school_id = %s", (school_id,))
         row = cur.fetchone()
         if row:
-            return row[0]
-        cur.execute(
-            "INSERT INTO universities (school_id, name) VALUES (%s, %s) RETURNING id",
-            (school_id, name or school_id),
-        )
-        uid = cur.fetchone()[0]
+            uid = row[0]
+            cur.execute(
+                "UPDATE universities SET name = COALESCE(%s, name), domain = COALESCE(%s, domain) WHERE id = %s",
+                (name, domain, uid),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO universities (school_id, name, domain) VALUES (%s, %s, %s) RETURNING id",
+                (school_id, name or school_id, domain),
+            )
+            uid = cur.fetchone()[0]
     conn.commit()
     return uid
 
@@ -172,7 +225,7 @@ def upsert_program(conn, university_id: int, program_code: str,
                    meta: dict, fields: dict, source_url: str,
                    confidence: float | None) -> int:
     """programs has UNIQUE(university_id, program_code); columns are overwritten only when non-null."""
-    set_fields = {k: v for k, v in fields.items() if k in PROGRAM_FIELDS and v is not None}
+    set_fields = _storable_fields(fields)
 
     with conn.cursor() as cur:
         cur.execute(
