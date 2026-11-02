@@ -25,4 +25,4 @@ playwright>=1.40.0
 trafilatura>=2.0            # DOM → markdown
 pymupdf>=1.24               # PDF text extraction
 langchain-text-splitters>=1.0   # chunking (Node 11)
-sentence-transformers>=5.0  # embeddings (only needed for ENABLE_EMBEDDING / backfill)
+sentence-transformers>=5.0  # embeddings and reranker (only used once vectors exist: --enable-embedding or backfill)

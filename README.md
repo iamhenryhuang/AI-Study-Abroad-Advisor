@@ -39,6 +39,19 @@ Before an answer is generated, a bounded evidence check (the Verifier) decides w
 | [`data_crawler/`](data_crawler/) | Ingestion pipeline: crawl official pages, extract structured fields with the source excerpt, validate each excerpt against the page, chunk and write to the database | source, CLI, per-school root URLs ([README](data_crawler/README.md)) |
 | [`db/`](db/) | PostgreSQL + pgvector schema, migrations and loaders | source, SQL, lists ([README](db/README.md)) |
 
+## Repository layout
+
+```text
+backend/            FastAPI service, command line and the agent
+  api.py, run.py    the two entry points
+  retriever/        agent/ (LangGraph), search/ (one module per retrieval path), recommendation
+  generator/        OpenAI client, answer prompts, answer generation
+  professor_fetcher/ query-time faculty lookup
+  database/         connection, schema commands, user experiences
+data_crawler/       ingestion graph: nodes/ (school and page steps), config/ (schools, parameters)
+db/                 schema/ (SQL), loaders/ (batch loaders), data/ (files you provide)
+```
+
 ## News
 
 - **2026-10** The paper is accepted to **TAAI 2026** (Domestic Track) and will appear in the official proceedings. It is assigned a poster presentation.
@@ -54,7 +67,7 @@ cd <this-repository>
 |---|---|---|
 | backend and data_crawler | `pip install -r requirements.txt`, then `playwright install chromium` | CPU is enough; the language model is called through the OpenAI API |
 | database | `docker compose up -d db` (PostgreSQL + pgvector, host port 5434) | disk space for the Docker image |
-| embeddings (optional) | BGE-M3 and a BGE reranker through `sentence-transformers`, then `python -m data_crawler.backfill_embeddings` | a GPU helps; without it the system falls back to PostgreSQL full-text search |
+| embeddings (optional) | BGE-M3 and a BGE reranker through `sentence-transformers`, then `python -m data_crawler.backfill_embeddings` | a GPU helps; until vectors exist the system uses PostgreSQL full-text search and loads no model |
 
 ## Data
 
@@ -67,8 +80,8 @@ This repository contains code only. It does not ship any data, and in particular
 How each kind of data is built:
 
 - **School information is crawled.** Run `data_crawler` against the schools you want, and mind each site's terms of use.
-- **Community reports and the faculty list are collected by hand.** We built some of them manually, partly because the sites block automated access and partly because it was simpler, and then loaded them from JSON files. The system does not depend on how the files were made, only on their format. `db/load_applicant_reports.py` reads `db/data/gradcafe_results.json` and `db/data/1point3.json`, and `load-professors` reads `db/data/professors.json`. Without the community files the Experience path has nothing to retrieve.
-- **School recommendation:** `backend/scripts/retriever/recommend.py` reads `db/data/1point3_distribution.json`, which you provide in the same way.
+- **Community reports and the faculty list are collected by hand.** We built some of them manually, partly because the sites block automated access and partly because it was simpler, and then loaded them from JSON files. The system does not depend on how the files were made, only on their format. `db/loaders/load_applicant_reports.py` reads `db/data/gradcafe_results.json` and `db/data/1point3.json`, and `load-professors` reads `db/data/professors.json`. Without the community files the Experience path has nothing to retrieve.
+- **School recommendation:** `backend/retriever/recommend.py` reads `db/data/1point3_distribution.json`, which you provide in the same way.
 
 [`db/data/README.md`](db/data/README.md) lists every file the system expects there and its format, including the faculty list that `load-professors` reads.
 
@@ -100,20 +113,20 @@ playwright install chromium
 cp .env.example backend/.env
 
 # 4. Empty schema
-python backend/scripts/run.py setup
-python backend/scripts/run.py init-schema
-python backend/scripts/run.py init-experience
+python backend/run.py setup
+python backend/run.py init-schema
+python backend/run.py init-experience
 
 # 5. Crawl a school's official pages, load faculty (optional; build db/data/professors.json first), check the result
 python -m data_crawler.main --school-id stanford --max-depth 1 --max-pages 10
-python backend/scripts/run.py load-professors
-python backend/scripts/run.py verify-db
+python backend/run.py load-professors
+python backend/run.py verify-db
 ```
 
 Ask the agent from the command line, or start the API:
 
 ```bash
-python backend/scripts/run.py agent "Stanford CS MS 申請費是多少？"
+python backend/run.py agent "Stanford CS MS 申請費是多少？"
 uvicorn backend.api:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -142,7 +155,7 @@ Community reports are not included in this repository; see [Data](#data). Withou
 <details>
 <summary>Do I need a GPU or the embedding models?</summary>
 
-No. Hybrid retrieval is optional. When the embedding model is missing, or `ENABLE_HYBRID_SEARCH=false`, the system uses PostgreSQL full-text search. Run `python -m data_crawler.backfill_embeddings` first if you do want vectors.
+No. Hybrid retrieval is optional. Until you run `python -m data_crawler.backfill_embeddings`, or when the embedding model is missing, or with `ENABLE_HYBRID_SEARCH=false`, the system uses PostgreSQL full-text search.
 
 </details>
 
@@ -163,7 +176,7 @@ Code comments, docstrings and log messages are in English. The remaining Chinese
 <details>
 <summary>I ran <code>init-schema</code> again and my crawled data is gone.</summary>
 
-`init-schema` drops and recreates the program tables. Run it once before crawling, and do not run it again afterwards.
+`init-schema` drops and recreates the crawler tables. Run it once before crawling, and do not run it again afterwards.
 
 </details>
 
